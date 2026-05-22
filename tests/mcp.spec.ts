@@ -900,3 +900,474 @@ test('summarizes preview, audits writes, and rolls back operation', async () => 
     await mock.close();
   }
 });
+
+// =============================================================================
+// People write tools — preview / apply / rollback per tool pair (Phase 1)
+// =============================================================================
+
+test('people add_note: preview → apply → rollback round-trip', async () => {
+  type Note = { id: string; note: string };
+  const notes: Map<string, Note> = new Map();
+  let nextNoteId = 1;
+
+  const mock = await startMockPco((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    const url = req.url ?? '';
+
+    if (url.startsWith('/people/v2/people/person-1') && !url.includes('/notes') && req.method === 'GET') {
+      res.end(JSON.stringify({
+        data: { id: 'person-1', type: 'Person', attributes: { name: 'Ada Lovelace' } },
+      }));
+      return;
+    }
+    if (url.startsWith('/people/v2/people/person-1/notes') && req.method === 'POST') {
+      let raw = '';
+      req.on('data', (chunk) => { raw += chunk.toString('utf8'); });
+      req.on('end', () => {
+        const body = JSON.parse(raw) as { data?: { attributes?: { note?: string } } };
+        const id = `note-${nextNoteId++}`;
+        notes.set(id, { id, note: body?.data?.attributes?.note ?? '' });
+        res.end(JSON.stringify({ data: { id, type: 'Note', attributes: { note: notes.get(id)!.note } } }));
+      });
+      return;
+    }
+    const deleteMatch = url.match(/^\/people\/v2\/people\/person-1\/notes\/([^/?]+)/);
+    if (deleteMatch && req.method === 'DELETE') {
+      notes.delete(deleteMatch[1]);
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end(JSON.stringify({ errors: [{ detail: 'not found' }] }));
+  });
+
+  const mcp = new McpProcess({
+    PCO_APP_ID: 'test-id',
+    PCO_SECRET: 'test-secret',
+    PCO_BASE_URL: mock.url,
+    PCO_PEOPLE_WRITES_ENABLED: 'true',
+  });
+
+  try {
+    await mcp.initialize();
+
+    const preview = await mcp.request('tools/call', {
+      name: 'pco_preview_add_note',
+      arguments: { personId: 'person-1', noteCategoryId: 'cat-1', text: 'Followed up by phone' },
+    }, 100);
+    const previewPayload = JSON.parse((preview.result as any).content[0].text) as { success: boolean; data: { previewToken: string; totalChanges: number } };
+    expect(previewPayload.success).toBe(true);
+    expect(previewPayload.data.totalChanges).toBe(1);
+
+    const apply = await mcp.request('tools/call', {
+      name: 'pco_apply_add_note',
+      arguments: { previewToken: previewPayload.data.previewToken, confirmPhrase: 'APPLY_CHANGES' },
+    }, 101);
+    const applyPayload = JSON.parse((apply.result as any).content[0].text) as { success: boolean; data: { operationId: string; appliedCount: number } };
+    expect(applyPayload.success).toBe(true);
+    expect(applyPayload.data.appliedCount).toBe(1);
+    expect(notes.size).toBe(1);
+
+    const rollback = await mcp.request('tools/call', {
+      name: 'pco_rollback_people_write_operation',
+      arguments: { operationId: applyPayload.data.operationId, confirmPhrase: 'ROLLBACK_CHANGES' },
+    }, 102);
+    const rollbackPayload = JSON.parse((rollback.result as any).content[0].text) as { success: boolean; data: { rolledBackCount: number } };
+    expect(rollbackPayload.success).toBe(true);
+    expect(rollbackPayload.data.rolledBackCount).toBe(1);
+    expect(notes.size).toBe(0);
+  } finally {
+    await mcp.close();
+    await mock.close();
+  }
+});
+
+test('people update_person_field: preview → apply → rollback round-trip', async () => {
+  let nickname: string | null = 'Adie';
+
+  const mock = await startMockPco((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    const url = req.url ?? '';
+
+    if (url.startsWith('/people/v2/people/person-1') && req.method === 'GET') {
+      res.end(JSON.stringify({
+        data: { id: 'person-1', type: 'Person', attributes: { name: 'Ada Lovelace', nickname } },
+      }));
+      return;
+    }
+    if (url.startsWith('/people/v2/people/person-1') && req.method === 'PATCH') {
+      let raw = '';
+      req.on('data', (chunk) => { raw += chunk.toString('utf8'); });
+      req.on('end', () => {
+        const body = JSON.parse(raw) as { data?: { attributes?: { nickname?: string } } };
+        nickname = body?.data?.attributes?.nickname ?? null;
+        res.end(JSON.stringify({ data: { id: 'person-1', type: 'Person', attributes: { name: 'Ada Lovelace', nickname } } }));
+      });
+      return;
+    }
+    res.statusCode = 404;
+    res.end(JSON.stringify({ errors: [{ detail: 'not found' }] }));
+  });
+
+  const mcp = new McpProcess({
+    PCO_APP_ID: 'test-id',
+    PCO_SECRET: 'test-secret',
+    PCO_BASE_URL: mock.url,
+    PCO_PEOPLE_WRITES_ENABLED: 'true',
+  });
+
+  try {
+    await mcp.initialize();
+    const preview = await mcp.request('tools/call', {
+      name: 'pco_preview_update_person_field',
+      arguments: { personId: 'person-1', field: 'nickname', value: 'Ada Lou' },
+    }, 110);
+    const previewPayload = JSON.parse((preview.result as any).content[0].text) as { success: boolean; data: { previewToken: string; totalChanges: number } };
+    expect(previewPayload.success).toBe(true);
+    expect(previewPayload.data.totalChanges).toBe(1);
+
+    const apply = await mcp.request('tools/call', {
+      name: 'pco_apply_update_person_field',
+      arguments: { previewToken: previewPayload.data.previewToken, confirmPhrase: 'APPLY_CHANGES' },
+    }, 111);
+    const applyPayload = JSON.parse((apply.result as any).content[0].text) as { success: boolean; data: { operationId: string; appliedCount: number } };
+    expect(applyPayload.success).toBe(true);
+    expect(applyPayload.data.appliedCount).toBe(1);
+    expect(nickname).toBe('Ada Lou');
+
+    const rollback = await mcp.request('tools/call', {
+      name: 'pco_rollback_people_write_operation',
+      arguments: { operationId: applyPayload.data.operationId, confirmPhrase: 'ROLLBACK_CHANGES' },
+    }, 112);
+    const rollbackPayload = JSON.parse((rollback.result as any).content[0].text) as { success: boolean; data: { rolledBackCount: number } };
+    expect(rollbackPayload.success).toBe(true);
+    expect(rollbackPayload.data.rolledBackCount).toBe(1);
+    expect(nickname).toBe('Adie');
+  } finally {
+    await mcp.close();
+    await mock.close();
+  }
+});
+
+test('people add_to_list: preview → apply → rollback round-trip', async () => {
+  const members = new Map<string, { id: string; personId: string }>();
+  let nextId = 1;
+
+  const mock = await startMockPco((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    const url = req.url ?? '';
+
+    if (url.startsWith('/people/v2/people/person-1') && !url.includes('/notes') && req.method === 'GET') {
+      res.end(JSON.stringify({
+        data: { id: 'person-1', type: 'Person', attributes: { name: 'Ada Lovelace' } },
+      }));
+      return;
+    }
+    if (url.startsWith('/people/v2/lists/list-1/list_results') && req.method === 'POST') {
+      let raw = '';
+      req.on('data', (chunk) => { raw += chunk.toString('utf8'); });
+      req.on('end', () => {
+        const body = JSON.parse(raw) as { data?: { relationships?: { person?: { data?: { id?: string } } } } };
+        const id = `lr-${nextId++}`;
+        const personId = body?.data?.relationships?.person?.data?.id ?? 'unknown';
+        members.set(id, { id, personId });
+        res.end(JSON.stringify({ data: { id, type: 'ListResult', attributes: {} } }));
+      });
+      return;
+    }
+    const delMatch = url.match(/^\/people\/v2\/lists\/list-1\/list_results\/([^/?]+)/);
+    if (delMatch && req.method === 'DELETE') {
+      members.delete(delMatch[1]);
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
+    res.statusCode = 404;
+    res.end(JSON.stringify({ errors: [{ detail: 'not found' }] }));
+  });
+
+  const mcp = new McpProcess({
+    PCO_APP_ID: 'test-id',
+    PCO_SECRET: 'test-secret',
+    PCO_BASE_URL: mock.url,
+    PCO_PEOPLE_WRITES_ENABLED: 'true',
+  });
+
+  try {
+    await mcp.initialize();
+    const preview = await mcp.request('tools/call', {
+      name: 'pco_preview_add_to_list',
+      arguments: { listId: 'list-1', personId: 'person-1' },
+    }, 120);
+    const previewPayload = JSON.parse((preview.result as any).content[0].text) as { success: boolean; data: { previewToken: string; totalChanges: number } };
+    expect(previewPayload.success).toBe(true);
+    expect(previewPayload.data.totalChanges).toBe(1);
+
+    const apply = await mcp.request('tools/call', {
+      name: 'pco_apply_add_to_list',
+      arguments: { previewToken: previewPayload.data.previewToken, confirmPhrase: 'APPLY_CHANGES' },
+    }, 121);
+    const applyPayload = JSON.parse((apply.result as any).content[0].text) as { success: boolean; data: { operationId: string; appliedCount: number } };
+    expect(applyPayload.success).toBe(true);
+    expect(applyPayload.data.appliedCount).toBe(1);
+    expect(members.size).toBe(1);
+
+    const rollback = await mcp.request('tools/call', {
+      name: 'pco_rollback_people_write_operation',
+      arguments: { operationId: applyPayload.data.operationId, confirmPhrase: 'ROLLBACK_CHANGES' },
+    }, 122);
+    const rollbackPayload = JSON.parse((rollback.result as any).content[0].text) as { success: boolean; data: { rolledBackCount: number } };
+    expect(rollbackPayload.success).toBe(true);
+    expect(rollbackPayload.data.rolledBackCount).toBe(1);
+    expect(members.size).toBe(0);
+  } finally {
+    await mcp.close();
+    await mock.close();
+  }
+});
+
+test('people remove_from_list: preview → apply → rollback round-trip', async () => {
+  // Starts with member present; remove then rollback should re-add.
+  const members = new Map<string, { id: string; personId: string }>([
+    ['lr-existing', { id: 'lr-existing', personId: 'person-1' }],
+  ]);
+  let nextId = 100;
+
+  const mock = await startMockPco((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    const url = req.url ?? '';
+
+    if (url.startsWith('/people/v2/lists/list-1/list_results') && req.method === 'GET') {
+      const matches = Array.from(members.values()).filter((m) => m.personId === 'person-1');
+      const data = matches.map((m) => ({ id: m.id, type: 'ListResult', attributes: {} }));
+      res.end(JSON.stringify({ data, meta: { total_count: data.length } }));
+      return;
+    }
+    if (url.startsWith('/people/v2/lists/list-1/list_results') && req.method === 'POST') {
+      let raw = '';
+      req.on('data', (chunk) => { raw += chunk.toString('utf8'); });
+      req.on('end', () => {
+        const body = JSON.parse(raw) as { data?: { relationships?: { person?: { data?: { id?: string } } } } };
+        const id = `lr-${nextId++}`;
+        const personId = body?.data?.relationships?.person?.data?.id ?? 'unknown';
+        members.set(id, { id, personId });
+        res.end(JSON.stringify({ data: { id, type: 'ListResult', attributes: {} } }));
+      });
+      return;
+    }
+    const delMatch = url.match(/^\/people\/v2\/lists\/list-1\/list_results\/([^/?]+)/);
+    if (delMatch && req.method === 'DELETE') {
+      members.delete(delMatch[1]);
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
+    res.statusCode = 404;
+    res.end(JSON.stringify({ errors: [{ detail: 'not found' }] }));
+  });
+
+  const mcp = new McpProcess({
+    PCO_APP_ID: 'test-id',
+    PCO_SECRET: 'test-secret',
+    PCO_BASE_URL: mock.url,
+    PCO_PEOPLE_WRITES_ENABLED: 'true',
+  });
+
+  try {
+    await mcp.initialize();
+    const preview = await mcp.request('tools/call', {
+      name: 'pco_preview_remove_from_list',
+      arguments: { listId: 'list-1', personId: 'person-1' },
+    }, 130);
+    const previewPayload = JSON.parse((preview.result as any).content[0].text) as { success: boolean; data: { previewToken: string; totalChanges: number } };
+    expect(previewPayload.success).toBe(true);
+    expect(previewPayload.data.totalChanges).toBe(1);
+
+    const apply = await mcp.request('tools/call', {
+      name: 'pco_apply_remove_from_list',
+      arguments: { previewToken: previewPayload.data.previewToken, confirmPhrase: 'APPLY_CHANGES' },
+    }, 131);
+    const applyPayload = JSON.parse((apply.result as any).content[0].text) as { success: boolean; data: { operationId: string; appliedCount: number } };
+    expect(applyPayload.success).toBe(true);
+    expect(applyPayload.data.appliedCount).toBe(1);
+    expect(members.size).toBe(0);
+
+    const rollback = await mcp.request('tools/call', {
+      name: 'pco_rollback_people_write_operation',
+      arguments: { operationId: applyPayload.data.operationId, confirmPhrase: 'ROLLBACK_CHANGES' },
+    }, 132);
+    const rollbackPayload = JSON.parse((rollback.result as any).content[0].text) as { success: boolean; data: { rolledBackCount: number } };
+    expect(rollbackPayload.success).toBe(true);
+    expect(rollbackPayload.data.rolledBackCount).toBe(1);
+    expect(members.size).toBe(1);
+  } finally {
+    await mcp.close();
+    await mock.close();
+  }
+});
+
+test('people create_workflow_card: preview → apply → rollback rejects as irreversible', async () => {
+  let createdCardId: string | null = null;
+
+  const mock = await startMockPco((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    const url = req.url ?? '';
+
+    if (url.startsWith('/people/v2/people/person-1') && req.method === 'GET') {
+      res.end(JSON.stringify({
+        data: { id: 'person-1', type: 'Person', attributes: { name: 'Ada Lovelace' } },
+      }));
+      return;
+    }
+    if (url.startsWith('/people/v2/people/assignee-1') && req.method === 'GET') {
+      res.end(JSON.stringify({
+        data: {
+          id: 'assignee-1',
+          type: 'Person',
+          attributes: { name: 'Pat Pastor' },
+          relationships: { emails: { data: [{ id: 'e-1', type: 'Email' }] } },
+        },
+        included: [{ id: 'e-1', type: 'Email', attributes: { address: 'pat@example.test', primary: true } }],
+      }));
+      return;
+    }
+    if (url.startsWith('/people/v2/workflows/wf-1') && !url.includes('/cards') && req.method === 'GET') {
+      res.end(JSON.stringify({
+        data: { id: 'wf-1', type: 'Workflow', attributes: { name: 'Guest Follow-up' } },
+      }));
+      return;
+    }
+    if (url.startsWith('/people/v2/workflows/wf-1/cards') && req.method === 'POST') {
+      let raw = '';
+      req.on('data', (chunk) => { raw += chunk.toString('utf8'); });
+      req.on('end', () => {
+        createdCardId = 'card-1';
+        res.end(JSON.stringify({ data: { id: createdCardId, type: 'WorkflowCard', attributes: {} } }));
+      });
+      return;
+    }
+    res.statusCode = 404;
+    res.end(JSON.stringify({ errors: [{ detail: 'not found' }] }));
+  });
+
+  const mcp = new McpProcess({
+    PCO_APP_ID: 'test-id',
+    PCO_SECRET: 'test-secret',
+    PCO_BASE_URL: mock.url,
+    PCO_PEOPLE_WRITES_ENABLED: 'true',
+  });
+
+  try {
+    await mcp.initialize();
+    const preview = await mcp.request('tools/call', {
+      name: 'pco_preview_create_workflow_card',
+      arguments: { workflowId: 'wf-1', personId: 'person-1', assigneeId: 'assignee-1', note: 'Call this week' },
+    }, 140);
+    const previewPayload = JSON.parse((preview.result as any).content[0].text) as { success: boolean; data: { previewToken: string; summary: { assigneeEmail?: string } } };
+    expect(previewPayload.success).toBe(true);
+    expect(previewPayload.data.summary.assigneeEmail).toBe('pat@example.test');
+
+    const apply = await mcp.request('tools/call', {
+      name: 'pco_apply_create_workflow_card',
+      arguments: { previewToken: previewPayload.data.previewToken, confirmPhrase: 'APPLY_CHANGES' },
+    }, 141);
+    const applyPayload = JSON.parse((apply.result as any).content[0].text) as { success: boolean; data: { operationId: string; appliedCount: number; irreversible: boolean } };
+    expect(applyPayload.success).toBe(true);
+    expect(applyPayload.data.appliedCount).toBe(1);
+    expect(applyPayload.data.irreversible).toBe(true);
+    expect(createdCardId).toBe('card-1');
+
+    const rollback = await mcp.request('tools/call', {
+      name: 'pco_rollback_people_write_operation',
+      arguments: { operationId: applyPayload.data.operationId, confirmPhrase: 'ROLLBACK_CHANGES' },
+    }, 142);
+    const rollbackPayload = JSON.parse((rollback.result as any).content[0].text) as { success: boolean; error: string | null };
+    expect(rollbackPayload.success).toBe(false);
+    expect(rollbackPayload.error).toMatch(/irreversible/i);
+  } finally {
+    await mcp.close();
+    await mock.close();
+  }
+});
+
+test('people update_household_membership (set_primary): preview → apply → rollback round-trip', async () => {
+  let primaryId = 'person-2';
+
+  const mock = await startMockPco((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    const url = req.url ?? '';
+
+    if (url.startsWith('/people/v2/households/h-1') && req.method === 'GET') {
+      res.end(JSON.stringify({
+        data: {
+          id: 'h-1',
+          type: 'Household',
+          attributes: { name: 'Lovelace Household' },
+          relationships: { primary_contact: { data: { id: primaryId, type: 'Person' } } },
+        },
+      }));
+      return;
+    }
+    if (url.startsWith('/people/v2/households/h-1') && req.method === 'PATCH') {
+      let raw = '';
+      req.on('data', (chunk) => { raw += chunk.toString('utf8'); });
+      req.on('end', () => {
+        const body = JSON.parse(raw) as { data?: { relationships?: { primary_contact?: { data?: { id?: string } } } } };
+        const newPrimary = body?.data?.relationships?.primary_contact?.data?.id;
+        if (newPrimary) primaryId = newPrimary;
+        res.end(JSON.stringify({
+          data: {
+            id: 'h-1',
+            type: 'Household',
+            attributes: { name: 'Lovelace Household' },
+            relationships: { primary_contact: { data: { id: primaryId, type: 'Person' } } },
+          },
+        }));
+      });
+      return;
+    }
+    res.statusCode = 404;
+    res.end(JSON.stringify({ errors: [{ detail: 'not found' }] }));
+  });
+
+  const mcp = new McpProcess({
+    PCO_APP_ID: 'test-id',
+    PCO_SECRET: 'test-secret',
+    PCO_BASE_URL: mock.url,
+    PCO_PEOPLE_WRITES_ENABLED: 'true',
+  });
+
+  try {
+    await mcp.initialize();
+    const preview = await mcp.request('tools/call', {
+      name: 'pco_preview_update_household_membership',
+      arguments: { householdId: 'h-1', personId: 'person-1', pending: 'set_primary' },
+    }, 150);
+    const previewPayload = JSON.parse((preview.result as any).content[0].text) as { success: boolean; data: { previewToken: string; totalChanges: number } };
+    expect(previewPayload.success).toBe(true);
+    expect(previewPayload.data.totalChanges).toBe(1);
+
+    const apply = await mcp.request('tools/call', {
+      name: 'pco_apply_update_household_membership',
+      arguments: { previewToken: previewPayload.data.previewToken, confirmPhrase: 'APPLY_CHANGES' },
+    }, 151);
+    const applyPayload = JSON.parse((apply.result as any).content[0].text) as { success: boolean; data: { operationId: string; appliedCount: number } };
+    expect(applyPayload.success).toBe(true);
+    expect(applyPayload.data.appliedCount).toBe(1);
+    expect(primaryId).toBe('person-1');
+
+    const rollback = await mcp.request('tools/call', {
+      name: 'pco_rollback_people_write_operation',
+      arguments: { operationId: applyPayload.data.operationId, confirmPhrase: 'ROLLBACK_CHANGES' },
+    }, 152);
+    const rollbackPayload = JSON.parse((rollback.result as any).content[0].text) as { success: boolean; data: { rolledBackCount: number } };
+    expect(rollbackPayload.success).toBe(true);
+    expect(rollbackPayload.data.rolledBackCount).toBe(1);
+    expect(primaryId).toBe('person-2');
+  } finally {
+    await mcp.close();
+    await mock.close();
+  }
+});

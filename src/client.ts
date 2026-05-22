@@ -54,8 +54,23 @@ export class PlanningCenterClient {
     return this.requestWithRetry<T>('PATCH', path, { data });
   }
 
+  /** Single POST request with retry/backoff for transient PCO failures and rate limits */
+  async post<T = JsonApiResponse>(
+    path: string,
+    data: unknown
+  ): Promise<T> {
+    return this.requestWithRetry<T>('POST', path, { data });
+  }
+
+  /** Single DELETE request with retry/backoff for transient PCO failures and rate limits */
+  async delete<T = unknown>(
+    path: string
+  ): Promise<T> {
+    return this.requestWithRetry<T>('DELETE', path, {});
+  }
+
   private async requestWithRetry<T>(
-    method: 'GET' | 'PATCH',
+    method: 'GET' | 'PATCH' | 'POST' | 'DELETE',
     path: string,
     options: { params?: Record<string, string | number>; data?: unknown } = {}
   ): Promise<T> {
@@ -64,9 +79,16 @@ export class PlanningCenterClient {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        const response = method === 'GET'
-          ? await this.http.get<T>(path, { params: options.params })
-          : await this.http.patch<T>(path, options.data);
+        let response;
+        if (method === 'GET') {
+          response = await this.http.get<T>(path, { params: options.params });
+        } else if (method === 'PATCH') {
+          response = await this.http.patch<T>(path, options.data);
+        } else if (method === 'POST') {
+          response = await this.http.post<T>(path, options.data);
+        } else {
+          response = await this.http.delete<T>(path);
+        }
         if (process.env.DEBUG) {
           console.error(`[PCO] ${method} ${path} attempt=${attempt} (${Date.now() - start}ms)`);
         }
