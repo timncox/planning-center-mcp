@@ -54,26 +54,50 @@ export class PlanningCenterClient {
     return this.requestWithRetry<T>('PATCH', path, { data });
   }
 
+  /** Single POST request. Retries only on transient 502/503/504 (not 429) since POST is non-idempotent. */
+  async post<T = JsonApiResponse>(
+    path: string,
+    data: unknown
+  ): Promise<T> {
+    return this.requestWithRetry<T>('POST', path, { data });
+  }
+
+  /** Single DELETE request. Retries only on transient 502/503/504. */
+  async delete<T = JsonApiResponse>(
+    path: string
+  ): Promise<T> {
+    return this.requestWithRetry<T>('DELETE', path, {});
+  }
+
   private async requestWithRetry<T>(
-    method: 'GET' | 'PATCH',
+    method: 'GET' | 'PATCH' | 'POST' | 'DELETE',
     path: string,
     options: { params?: Record<string, string | number>; data?: unknown } = {}
   ): Promise<T> {
     const start = Date.now();
     const maxAttempts = 3;
+    const idempotent = method === 'GET' || method === 'PATCH';
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        const response = method === 'GET'
-          ? await this.http.get<T>(path, { params: options.params })
-          : await this.http.patch<T>(path, options.data);
+        let response;
+        if (method === 'GET') {
+          response = await this.http.get<T>(path, { params: options.params });
+        } else if (method === 'PATCH') {
+          response = await this.http.patch<T>(path, options.data);
+        } else if (method === 'POST') {
+          response = await this.http.post<T>(path, options.data);
+        } else {
+          response = await this.http.delete<T>(path);
+        }
         if (process.env.DEBUG) {
           console.error(`[PCO] ${method} ${path} attempt=${attempt} (${Date.now() - start}ms)`);
         }
         return response.data;
       } catch (err) {
         const status = err instanceof AxiosError ? err.response?.status : undefined;
-        const retryable = status === 429 || status === 502 || status === 503 || status === 504;
+        const transient = status === 502 || status === 503 || status === 504;
+        const retryable = (status === 429 && idempotent) || transient;
         if (!retryable || attempt === maxAttempts) {
           throw err;
         }
