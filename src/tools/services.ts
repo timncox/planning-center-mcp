@@ -7,6 +7,16 @@ import { toolSuccess, toolError } from '../response.js';
 type MatchMode = 'exact' | 'contains' | 'regex';
 type SyncField = 'title' | 'description' | 'notes';
 
+type PreviewOperationKind =
+  | 'replace'
+  | 'sync'
+  | 'add_song'
+  | 'reorder'
+  | 'set_key_tempo'
+  | 'schedule_position'
+  | 'confirm_position'
+  | 'create_plan';
+
 type PreviewChange = {
   serviceTypeId: string;
   planId: string;
@@ -17,11 +27,23 @@ type PreviewChange = {
   beforeAttributes: Record<string, unknown>;
   afterAttributes: Record<string, unknown>;
   reason?: string;
+  // For new write kinds: how to apply / how to roll back. Optional so legacy kinds keep working.
+  applyMethod?: 'PATCH' | 'POST' | 'DELETE';
+  applyEndpoint?: string;
+  applyBody?: Record<string, unknown>;
+  rollbackMethod?: 'PATCH' | 'POST' | 'DELETE' | 'NONE';
+  rollbackEndpoint?: string;
+  rollbackBody?: Record<string, unknown>;
+  // Captured at apply time for kinds that create resources (e.g. add_song, create_plan, schedule_position)
+  createdResourceId?: string;
+  createdResourceType?: string;
+  // Extras shown in summary (e.g. recipient names for schedule_position).
+  metadata?: Record<string, unknown>;
 };
 
 type PreviewOperation = {
   token: string;
-  kind: 'replace' | 'sync';
+  kind: PreviewOperationKind;
   createdAt: string;
   expiresAt: string;
   changes: PreviewChange[];
@@ -30,12 +52,14 @@ type PreviewOperation = {
 
 type AppliedWriteOperation = {
   operationId: string;
-  kind: 'replace' | 'sync';
+  kind: PreviewOperationKind;
   appliedAt: string;
   sourcePreviewToken: string;
   applied: PreviewChange[];
   skipped: Array<Record<string, unknown>>;
   errors: Array<Record<string, unknown>>;
+  irreversible?: boolean;
+  irreversibleReason?: string;
 };
 
 const PREVIEW_TTL_MS = 15 * 60_000;
@@ -52,7 +76,7 @@ function prunePreviewOperations() {
   }
 }
 
-function createPreviewOperation(kind: 'replace' | 'sync', changes: PreviewChange[], summary: Record<string, unknown>) {
+function createPreviewOperation(kind: PreviewOperationKind, changes: PreviewChange[], summary: Record<string, unknown>) {
   prunePreviewOperations();
   const token = `preview_${crypto.randomBytes(18).toString('base64url')}`;
   const createdAt = new Date().toISOString();
@@ -62,7 +86,7 @@ function createPreviewOperation(kind: 'replace' | 'sync', changes: PreviewChange
   return op;
 }
 
-function getPreviewOperation(token: string, kind: 'replace' | 'sync') {
+function getPreviewOperation(token: string, kind: PreviewOperationKind) {
   prunePreviewOperations();
   const op = previewOperations.get(token);
   if (!op || op.kind !== kind) return null;
@@ -1069,6 +1093,891 @@ export async function handleServicesTool(
         }));
       }
 
+      // -----------------------------------------------------------------
+      // 1. add_song — insert a song item at position N in a plan
+      // -----------------------------------------------------------------
+      case 'pco_preview_add_song_to_plan': {
+        const schema = z.object({
+          serviceTypeId: z.string(),
+          planId: z.string(),
+          songId: z.string(),
+          position: z.number().int().positive(),
+          arrangementId: z.string().optional(),
+          key: z.string().optional(),
+        });
+        const parsed = schema.parse(args);
+
+        const writableError = validateWritableTargets([parsed.serviceTypeId]);
+        if (writableError) return JSON.stringify(toolError(writableError));
+
+        const itemsEndpoint = `/services/v2/service_types/${parsed.serviceTypeId}/plans/${parsed.planId}/items`;
+        // Fetch a snapshot of current items so we can describe the insertion context.
+        const existing = await getPlanItems(client, parsed.serviceTypeId, parsed.planId);
+        const insertContext = {
+          existingItemCount: existing.length,
+          insertionPosition: parsed.position,
+          previousItemAtPosition: existing.find((item) => Number(item.sequence ?? -1) === parsed.position) ?? null,
+        };
+
+        const relationships: Record<string, unknown> = {
+          song: { data: { type: 'Song', id: parsed.songId } },
+        };
+        if (parsed.arrangementId) {
+          relationships.arrangement = { data: { type: 'Arrangement', id: parsed.arrangementId } };
+        }
+
+        const applyBody: Record<string, unknown> = {
+          data: {
+            type: 'Item',
+            attributes: {
+              item_type: 'song',
+              sequence: parsed.position,
+              ...(parsed.key ? { key_name: parsed.key } : {}),
+            },
+            relationships,
+          },
+        };
+
+        const change: PreviewChange = {
+          serviceTypeId: parsed.serviceTypeId,
+          planId: parsed.planId,
+          itemId: '',
+          itemSequence: parsed.position,
+          itemType: 'song',
+          beforeAttributes: {},
+          afterAttributes: {
+            item_type: 'song',
+            sequence: parsed.position,
+            song_id: parsed.songId,
+            ...(parsed.arrangementId ? { arrangement_id: parsed.arrangementId } : {}),
+            ...(parsed.key ? { key_name: parsed.key } : {}),
+          },
+          reason: `Insert song ${parsed.songId} at sequence ${parsed.position}`,
+          applyMethod: 'POST',
+          applyEndpoint: itemsEndpoint,
+          applyBody,
+          rollbackMethod: 'DELETE',
+          // rollbackEndpoint is populated at apply time once we know createdResourceId
+          metadata: { insertContext },
+        };
+
+        const op = createPreviewOperation('add_song', [change], {
+          serviceTypeId: parsed.serviceTypeId,
+          planId: parsed.planId,
+          songId: parsed.songId,
+          position: parsed.position,
+          arrangementId: parsed.arrangementId ?? null,
+          key: parsed.key ?? null,
+          insertContext,
+        });
+
+        return JSON.stringify(toolSuccess({
+          previewToken: op.token,
+          createdAt: op.createdAt,
+          expiresAt: op.expiresAt,
+          totalChanges: 1,
+          summary: { ...summarizePreviewChanges([change]), insertContext },
+          changes: [change],
+        }, {
+          count: 1,
+          pcoEndpoint: itemsEndpoint,
+          executionMs: Date.now() - start,
+        }));
+      }
+
+      case 'pco_apply_add_song_to_plan': {
+        const schema = z.object({
+          previewToken: z.string(),
+          confirmPhrase: z.literal('APPLY_CHANGES'),
+        });
+        const parsed = schema.parse(args);
+        const op = getPreviewOperation(parsed.previewToken, 'add_song');
+        if (!op) return JSON.stringify(toolError('Invalid or expired previewToken for add_song operation. Run preview again.'));
+
+        const writableError = validateWritableTargets(op.changes.map((change) => change.serviceTypeId));
+        if (writableError) return JSON.stringify(toolError(writableError));
+
+        const applied: PreviewChange[] = [];
+        const skipped: Array<Record<string, unknown>> = [];
+        const errors: Array<Record<string, unknown>> = [];
+
+        for (const change of op.changes) {
+          try {
+            const result = await client.post<any>(
+              change.applyEndpoint as string,
+              change.applyBody
+            );
+            const createdId = String(result?.data?.id ?? '');
+            const appliedChange: PreviewChange = {
+              ...change,
+              itemId: createdId || change.itemId,
+              createdResourceId: createdId,
+              createdResourceType: 'Item',
+              rollbackEndpoint: createdId
+                ? `${change.applyEndpoint}/${createdId}`
+                : undefined,
+              rollbackMethod: createdId ? 'DELETE' : 'NONE',
+            };
+            applied.push(appliedChange);
+          } catch (err) {
+            errors.push({ ...change, error: PlanningCenterClient.formatError(err, 'Services') });
+          }
+        }
+
+        previewOperations.delete(parsed.previewToken);
+        const operationId = `add_song_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+        saveAuditOperation({
+          operationId,
+          kind: 'add_song',
+          appliedAt: new Date().toISOString(),
+          sourcePreviewToken: parsed.previewToken,
+          applied,
+          skipped,
+          errors,
+        });
+
+        return JSON.stringify(toolSuccess({
+          operationId,
+          sourcePreviewToken: parsed.previewToken,
+          attempted: op.changes.length,
+          appliedCount: applied.length,
+          skippedCount: skipped.length,
+          errorCount: errors.length,
+          applied,
+          skipped,
+          errors,
+        }, {
+          count: applied.length,
+          pcoEndpoint: '/services/v2/service_types/*/plans/*/items',
+          executionMs: Date.now() - start,
+        }));
+      }
+
+      // -----------------------------------------------------------------
+      // 2. reorder_plan_items — patch sequence on each item
+      // -----------------------------------------------------------------
+      case 'pco_preview_reorder_plan_items': {
+        const schema = z.object({
+          serviceTypeId: z.string(),
+          planId: z.string(),
+          itemIdsInOrder: z.array(z.string()).min(1),
+        });
+        const parsed = schema.parse(args);
+
+        const writableError = validateWritableTargets([parsed.serviceTypeId]);
+        if (writableError) return JSON.stringify(toolError(writableError));
+
+        const existing = await getPlanItems(client, parsed.serviceTypeId, parsed.planId);
+        const byId = new Map(existing.map((item) => [item.id, item]));
+        const missing = parsed.itemIdsInOrder.filter((id) => !byId.has(id));
+        if (missing.length > 0) {
+          return JSON.stringify(toolError(`These itemIds are not on this plan: ${missing.join(', ')}`));
+        }
+
+        const changes: PreviewChange[] = [];
+        parsed.itemIdsInOrder.forEach((itemId, index) => {
+          const item = byId.get(itemId)!;
+          const before = Number(item.sequence ?? 0);
+          const after = index + 1;
+          if (before === after) return;
+
+          const endpoint = `/services/v2/service_types/${parsed.serviceTypeId}/plans/${parsed.planId}/items/${itemId}`;
+          changes.push({
+            serviceTypeId: parsed.serviceTypeId,
+            planId: parsed.planId,
+            itemId,
+            itemSequence: after,
+            itemType: String(item.item_type ?? ''),
+            beforeAttributes: { sequence: before },
+            afterAttributes: { sequence: after },
+            reason: `Reorder ${itemId} from sequence ${before} to ${after}`,
+            applyMethod: 'PATCH',
+            applyEndpoint: endpoint,
+            applyBody: { data: { type: 'Item', attributes: { sequence: after } } },
+            rollbackMethod: 'PATCH',
+            rollbackEndpoint: endpoint,
+            rollbackBody: { data: { type: 'Item', attributes: { sequence: before } } },
+          });
+        });
+
+        const op = createPreviewOperation('reorder', changes, {
+          serviceTypeId: parsed.serviceTypeId,
+          planId: parsed.planId,
+          requestedOrder: parsed.itemIdsInOrder,
+          itemsOnPlan: existing.length,
+        });
+
+        return JSON.stringify(toolSuccess({
+          previewToken: op.token,
+          createdAt: op.createdAt,
+          expiresAt: op.expiresAt,
+          totalChanges: changes.length,
+          summary: summarizePreviewChanges(changes),
+          changes,
+        }, {
+          count: changes.length,
+          pcoEndpoint: `/services/v2/service_types/${parsed.serviceTypeId}/plans/${parsed.planId}/items/*`,
+          executionMs: Date.now() - start,
+        }));
+      }
+
+      case 'pco_apply_reorder_plan_items': {
+        const schema = z.object({
+          previewToken: z.string(),
+          confirmPhrase: z.literal('APPLY_CHANGES'),
+        });
+        const parsed = schema.parse(args);
+        const op = getPreviewOperation(parsed.previewToken, 'reorder');
+        if (!op) return JSON.stringify(toolError('Invalid or expired previewToken for reorder operation. Run preview again.'));
+
+        const writableError = validateWritableTargets(op.changes.map((change) => change.serviceTypeId));
+        if (writableError) return JSON.stringify(toolError(writableError));
+
+        const applied: PreviewChange[] = [];
+        const skipped: Array<Record<string, unknown>> = [];
+        const errors: Array<Record<string, unknown>> = [];
+
+        for (const change of op.changes) {
+          try {
+            await client.patch(change.applyEndpoint as string, change.applyBody);
+            applied.push(change);
+          } catch (err) {
+            errors.push({ ...change, error: PlanningCenterClient.formatError(err, 'Services') });
+          }
+        }
+
+        previewOperations.delete(parsed.previewToken);
+        const operationId = `reorder_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+        saveAuditOperation({
+          operationId,
+          kind: 'reorder',
+          appliedAt: new Date().toISOString(),
+          sourcePreviewToken: parsed.previewToken,
+          applied,
+          skipped,
+          errors,
+        });
+
+        return JSON.stringify(toolSuccess({
+          operationId,
+          sourcePreviewToken: parsed.previewToken,
+          attempted: op.changes.length,
+          appliedCount: applied.length,
+          skippedCount: skipped.length,
+          errorCount: errors.length,
+          applied,
+          skipped,
+          errors,
+        }, {
+          count: applied.length,
+          pcoEndpoint: '/services/v2/service_types/*/plans/*/items/*',
+          executionMs: Date.now() - start,
+        }));
+      }
+
+      // -----------------------------------------------------------------
+      // 3. set_item_key_or_tempo — patch a song item's key / length / arrangement
+      // -----------------------------------------------------------------
+      case 'pco_preview_set_item_key_or_tempo': {
+        const schema = z.object({
+          serviceTypeId: z.string(),
+          planId: z.string(),
+          itemId: z.string(),
+          key: z.string().optional(),
+          length: z.number().int().nonnegative().optional(),
+          arrangementId: z.string().optional(),
+        }).refine(
+          (value) => Boolean(value.key || typeof value.length === 'number' || value.arrangementId),
+          { message: 'Provide at least one of: key, length, arrangementId.' }
+        );
+        const parsed = schema.parse(args);
+
+        const writableError = validateWritableTargets([parsed.serviceTypeId]);
+        if (writableError) return JSON.stringify(toolError(writableError));
+
+        const endpoint = `/services/v2/service_types/${parsed.serviceTypeId}/plans/${parsed.planId}/items/${parsed.itemId}`;
+        const current = await client.get<any>(endpoint);
+        if (!current?.data) {
+          return JSON.stringify(toolError(`Item ${parsed.itemId} not found on plan ${parsed.planId}.`));
+        }
+        const currentFlat = client.flatten(current.data);
+
+        const before: Record<string, unknown> = {};
+        const after: Record<string, unknown> = {};
+        if (parsed.key !== undefined) {
+          before.key_name = currentFlat.key_name ?? null;
+          after.key_name = parsed.key;
+        }
+        if (parsed.length !== undefined) {
+          before.length = currentFlat.length ?? null;
+          after.length = parsed.length;
+        }
+        if (parsed.arrangementId !== undefined) {
+          // For arrangement we PATCH a relationship; capture before via the current relationship snapshot.
+          const rel = (current.data as any)?.relationships?.arrangement?.data;
+          before.arrangement_id = rel?.id ?? null;
+          after.arrangement_id = parsed.arrangementId;
+        }
+
+        if (JSON.stringify(before) === JSON.stringify(after)) {
+          return JSON.stringify(toolSuccess({
+            previewToken: null,
+            totalChanges: 0,
+            summary: { totalChanges: 0, serviceTypeBreakdown: {}, itemTypeBreakdown: {}, topPlans: [] },
+            changes: [],
+            note: 'No changes — item already matches requested values.',
+          }, {
+            count: 0,
+            pcoEndpoint: endpoint,
+            executionMs: Date.now() - start,
+          }));
+        }
+
+        // Build apply body: PATCH attributes (key/length) and optionally relationships (arrangement)
+        const attributes: Record<string, unknown> = {};
+        if (parsed.key !== undefined) attributes.key_name = parsed.key;
+        if (parsed.length !== undefined) attributes.length = parsed.length;
+        const relationships: Record<string, unknown> = {};
+        if (parsed.arrangementId !== undefined) {
+          relationships.arrangement = { data: { type: 'Arrangement', id: parsed.arrangementId } };
+        }
+        const applyData: Record<string, unknown> = { type: 'Item', attributes };
+        if (Object.keys(relationships).length > 0) applyData.relationships = relationships;
+
+        // Rollback body: revert attributes and arrangement relationship.
+        const rollbackAttributes: Record<string, unknown> = {};
+        if (parsed.key !== undefined) rollbackAttributes.key_name = currentFlat.key_name ?? null;
+        if (parsed.length !== undefined) rollbackAttributes.length = currentFlat.length ?? null;
+        const rollbackRelationships: Record<string, unknown> = {};
+        if (parsed.arrangementId !== undefined) {
+          const rel = (current.data as any)?.relationships?.arrangement?.data;
+          rollbackRelationships.arrangement = { data: rel ? { type: 'Arrangement', id: rel.id } : null };
+        }
+        const rollbackData: Record<string, unknown> = { type: 'Item', attributes: rollbackAttributes };
+        if (Object.keys(rollbackRelationships).length > 0) rollbackData.relationships = rollbackRelationships;
+
+        const change: PreviewChange = {
+          serviceTypeId: parsed.serviceTypeId,
+          planId: parsed.planId,
+          itemId: parsed.itemId,
+          itemSequence: Number(currentFlat.sequence ?? 0),
+          itemType: String(currentFlat.item_type ?? ''),
+          beforeAttributes: before,
+          afterAttributes: after,
+          reason: 'Update song item attributes',
+          applyMethod: 'PATCH',
+          applyEndpoint: endpoint,
+          applyBody: { data: applyData },
+          rollbackMethod: 'PATCH',
+          rollbackEndpoint: endpoint,
+          rollbackBody: { data: rollbackData },
+        };
+
+        const op = createPreviewOperation('set_key_tempo', [change], {
+          serviceTypeId: parsed.serviceTypeId,
+          planId: parsed.planId,
+          itemId: parsed.itemId,
+          fieldsChanged: Object.keys(after),
+        });
+
+        return JSON.stringify(toolSuccess({
+          previewToken: op.token,
+          createdAt: op.createdAt,
+          expiresAt: op.expiresAt,
+          totalChanges: 1,
+          summary: summarizePreviewChanges([change]),
+          changes: [change],
+        }, {
+          count: 1,
+          pcoEndpoint: endpoint,
+          executionMs: Date.now() - start,
+        }));
+      }
+
+      case 'pco_apply_set_item_key_or_tempo': {
+        const schema = z.object({
+          previewToken: z.string(),
+          confirmPhrase: z.literal('APPLY_CHANGES'),
+        });
+        const parsed = schema.parse(args);
+        const op = getPreviewOperation(parsed.previewToken, 'set_key_tempo');
+        if (!op) return JSON.stringify(toolError('Invalid or expired previewToken for set_key_tempo operation. Run preview again.'));
+
+        const writableError = validateWritableTargets(op.changes.map((change) => change.serviceTypeId));
+        if (writableError) return JSON.stringify(toolError(writableError));
+
+        const applied: PreviewChange[] = [];
+        const skipped: Array<Record<string, unknown>> = [];
+        const errors: Array<Record<string, unknown>> = [];
+
+        for (const change of op.changes) {
+          try {
+            await client.patch(change.applyEndpoint as string, change.applyBody);
+            applied.push(change);
+          } catch (err) {
+            errors.push({ ...change, error: PlanningCenterClient.formatError(err, 'Services') });
+          }
+        }
+
+        previewOperations.delete(parsed.previewToken);
+        const operationId = `set_key_tempo_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+        saveAuditOperation({
+          operationId,
+          kind: 'set_key_tempo',
+          appliedAt: new Date().toISOString(),
+          sourcePreviewToken: parsed.previewToken,
+          applied,
+          skipped,
+          errors,
+        });
+
+        return JSON.stringify(toolSuccess({
+          operationId,
+          sourcePreviewToken: parsed.previewToken,
+          attempted: op.changes.length,
+          appliedCount: applied.length,
+          skippedCount: skipped.length,
+          errorCount: errors.length,
+          applied,
+          skipped,
+          errors,
+        }, {
+          count: applied.length,
+          pcoEndpoint: '/services/v2/service_types/*/plans/*/items/*',
+          executionMs: Date.now() - start,
+        }));
+      }
+
+      // -----------------------------------------------------------------
+      // 4. schedule_position — POST PlanPerson (IRREVERSIBLE — sends notification email)
+      // -----------------------------------------------------------------
+      case 'pco_preview_schedule_position': {
+        const schema = z.object({
+          serviceTypeId: z.string(),
+          planId: z.string(),
+          teamId: z.string(),
+          personId: z.string(),
+          positionName: z.string(),
+        });
+        const parsed = schema.parse(args);
+
+        const writableError = validateWritableTargets([parsed.serviceTypeId]);
+        if (writableError) return JSON.stringify(toolError(writableError));
+
+        // Fetch person + plan + team metadata for summary (best-effort — failures don't block preview).
+        let personName: string | null = null;
+        let planDate: string | null = null;
+        let planTitle: string | null = null;
+        try {
+          const personResp = await client.get<any>(`/people/v2/people/${parsed.personId}`);
+          if (personResp?.data) {
+            const flat = client.flatten(personResp.data);
+            const composed = `${flat.first_name ?? ''} ${flat.last_name ?? ''}`.trim();
+            personName = String((flat.name ?? composed) || flat.id);
+          }
+        } catch { /* best-effort */ }
+        try {
+          const planResp = await client.get<any>(`/services/v2/service_types/${parsed.serviceTypeId}/plans/${parsed.planId}`);
+          if (planResp?.data) {
+            const flat = client.flatten(planResp.data);
+            planDate = String(flat.sort_date ?? '') || null;
+            planTitle = String(flat.title ?? flat.dates ?? '') || null;
+          }
+        } catch { /* best-effort */ }
+
+        const teamMembersEndpoint = `/services/v2/service_types/${parsed.serviceTypeId}/plans/${parsed.planId}/team_members`;
+        const applyBody = {
+          data: {
+            type: 'PlanPerson',
+            attributes: {
+              team_position_name: parsed.positionName,
+            },
+            relationships: {
+              team: { data: { type: 'Team', id: parsed.teamId } },
+              person: { data: { type: 'Person', id: parsed.personId } },
+            },
+          },
+        };
+
+        const recipient = personName ?? parsed.personId;
+        const notificationSummary = `Schedule ${recipient} to position "${parsed.positionName}"${planDate ? ` for plan on ${planDate}` : ''}. PCO will email the volunteer.`;
+
+        const change: PreviewChange = {
+          serviceTypeId: parsed.serviceTypeId,
+          planId: parsed.planId,
+          itemId: '',
+          beforeAttributes: {},
+          afterAttributes: {
+            team_id: parsed.teamId,
+            person_id: parsed.personId,
+            team_position_name: parsed.positionName,
+          },
+          reason: notificationSummary,
+          applyMethod: 'POST',
+          applyEndpoint: teamMembersEndpoint,
+          applyBody,
+          // Notification is irreversible; the team_member row could be DELETEd but the email has been sent.
+          rollbackMethod: 'NONE',
+          metadata: {
+            recipient,
+            personId: parsed.personId,
+            positionName: parsed.positionName,
+            planDate,
+            planTitle,
+          },
+        };
+
+        const op = createPreviewOperation('schedule_position', [change], {
+          serviceTypeId: parsed.serviceTypeId,
+          planId: parsed.planId,
+          recipient,
+          personId: parsed.personId,
+          positionName: parsed.positionName,
+          planDate,
+          planTitle,
+          warning: 'IRREVERSIBLE — applying will send a notification email to the volunteer.',
+        });
+
+        return JSON.stringify(toolSuccess({
+          previewToken: op.token,
+          createdAt: op.createdAt,
+          expiresAt: op.expiresAt,
+          totalChanges: 1,
+          summary: { ...summarizePreviewChanges([change]), recipient, positionName: parsed.positionName, planDate, irreversible: true, notificationSummary },
+          changes: [change],
+        }, {
+          count: 1,
+          pcoEndpoint: teamMembersEndpoint,
+          executionMs: Date.now() - start,
+        }));
+      }
+
+      case 'pco_apply_schedule_position': {
+        const schema = z.object({
+          previewToken: z.string(),
+          confirmPhrase: z.literal('APPLY_CHANGES'),
+        });
+        const parsed = schema.parse(args);
+        const op = getPreviewOperation(parsed.previewToken, 'schedule_position');
+        if (!op) return JSON.stringify(toolError('Invalid or expired previewToken for schedule_position operation. Run preview again.'));
+
+        const writableError = validateWritableTargets(op.changes.map((change) => change.serviceTypeId));
+        if (writableError) return JSON.stringify(toolError(writableError));
+
+        const applied: PreviewChange[] = [];
+        const skipped: Array<Record<string, unknown>> = [];
+        const errors: Array<Record<string, unknown>> = [];
+        const recipientsNotified: string[] = [];
+
+        for (const change of op.changes) {
+          try {
+            const result = await client.post<any>(change.applyEndpoint as string, change.applyBody);
+            const createdId = String(result?.data?.id ?? '');
+            const appliedChange: PreviewChange = {
+              ...change,
+              itemId: createdId || change.itemId,
+              createdResourceId: createdId,
+              createdResourceType: 'PlanPerson',
+            };
+            applied.push(appliedChange);
+            const recipient = (change.metadata as any)?.recipient;
+            if (recipient) recipientsNotified.push(String(recipient));
+          } catch (err) {
+            errors.push({ ...change, error: PlanningCenterClient.formatError(err, 'Services') });
+          }
+        }
+
+        previewOperations.delete(parsed.previewToken);
+        const operationId = `schedule_position_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+        saveAuditOperation({
+          operationId,
+          kind: 'schedule_position',
+          appliedAt: new Date().toISOString(),
+          sourcePreviewToken: parsed.previewToken,
+          applied,
+          skipped,
+          errors,
+          irreversible: true,
+          irreversibleReason: recipientsNotified.length > 0
+            ? `Notification email was sent to ${recipientsNotified.join(', ')}.`
+            : 'Notification email was sent to the scheduled volunteer(s).',
+        });
+
+        return JSON.stringify(toolSuccess({
+          operationId,
+          sourcePreviewToken: parsed.previewToken,
+          attempted: op.changes.length,
+          appliedCount: applied.length,
+          skippedCount: skipped.length,
+          errorCount: errors.length,
+          applied,
+          skipped,
+          errors,
+          irreversible: true,
+          irreversibleReason: 'Notification email was sent. Rollback will refuse.',
+        }, {
+          count: applied.length,
+          pcoEndpoint: '/services/v2/service_types/*/plans/*/team_members',
+          executionMs: Date.now() - start,
+        }));
+      }
+
+      // -----------------------------------------------------------------
+      // 5. confirm_or_decline_position — PATCH PlanPerson status to C / D
+      // -----------------------------------------------------------------
+      case 'pco_preview_confirm_or_decline_position': {
+        const schema = z.object({
+          serviceTypeId: z.string(),
+          planId: z.string(),
+          planPersonId: z.string(),
+          status: z.enum(['C', 'D']),
+        });
+        const parsed = schema.parse(args);
+
+        const writableError = validateWritableTargets([parsed.serviceTypeId]);
+        if (writableError) return JSON.stringify(toolError(writableError));
+
+        const endpoint = `/services/v2/service_types/${parsed.serviceTypeId}/plans/${parsed.planId}/team_members/${parsed.planPersonId}`;
+        const current = await client.get<any>(endpoint);
+        if (!current?.data) {
+          return JSON.stringify(toolError(`PlanPerson ${parsed.planPersonId} not found on plan ${parsed.planId}.`));
+        }
+        const currentFlat = client.flatten(current.data);
+        const beforeStatus = String((currentFlat as any).status ?? '');
+
+        if (beforeStatus === parsed.status) {
+          return JSON.stringify(toolSuccess({
+            previewToken: null,
+            totalChanges: 0,
+            summary: { totalChanges: 0, serviceTypeBreakdown: {}, itemTypeBreakdown: {}, topPlans: [] },
+            changes: [],
+            note: `Status is already ${parsed.status}; no change required.`,
+          }, {
+            count: 0,
+            pcoEndpoint: endpoint,
+            executionMs: Date.now() - start,
+          }));
+        }
+
+        const change: PreviewChange = {
+          serviceTypeId: parsed.serviceTypeId,
+          planId: parsed.planId,
+          itemId: parsed.planPersonId,
+          beforeAttributes: { status: beforeStatus },
+          afterAttributes: { status: parsed.status },
+          reason: `Set PlanPerson status from ${beforeStatus || '(empty)'} to ${parsed.status}`,
+          applyMethod: 'PATCH',
+          applyEndpoint: endpoint,
+          applyBody: { data: { type: 'PlanPerson', attributes: { status: parsed.status } } },
+          rollbackMethod: 'PATCH',
+          rollbackEndpoint: endpoint,
+          rollbackBody: { data: { type: 'PlanPerson', attributes: { status: beforeStatus } } },
+          metadata: {
+            personName: (currentFlat as any).name ?? null,
+            positionName: (currentFlat as any).team_position_name ?? null,
+          },
+        };
+
+        const op = createPreviewOperation('confirm_position', [change], {
+          serviceTypeId: parsed.serviceTypeId,
+          planId: parsed.planId,
+          planPersonId: parsed.planPersonId,
+          beforeStatus,
+          afterStatus: parsed.status,
+        });
+
+        return JSON.stringify(toolSuccess({
+          previewToken: op.token,
+          createdAt: op.createdAt,
+          expiresAt: op.expiresAt,
+          totalChanges: 1,
+          summary: summarizePreviewChanges([change]),
+          changes: [change],
+        }, {
+          count: 1,
+          pcoEndpoint: endpoint,
+          executionMs: Date.now() - start,
+        }));
+      }
+
+      case 'pco_apply_confirm_or_decline_position': {
+        const schema = z.object({
+          previewToken: z.string(),
+          confirmPhrase: z.literal('APPLY_CHANGES'),
+        });
+        const parsed = schema.parse(args);
+        const op = getPreviewOperation(parsed.previewToken, 'confirm_position');
+        if (!op) return JSON.stringify(toolError('Invalid or expired previewToken for confirm_position operation. Run preview again.'));
+
+        const writableError = validateWritableTargets(op.changes.map((change) => change.serviceTypeId));
+        if (writableError) return JSON.stringify(toolError(writableError));
+
+        const applied: PreviewChange[] = [];
+        const skipped: Array<Record<string, unknown>> = [];
+        const errors: Array<Record<string, unknown>> = [];
+
+        for (const change of op.changes) {
+          try {
+            await client.patch(change.applyEndpoint as string, change.applyBody);
+            applied.push(change);
+          } catch (err) {
+            errors.push({ ...change, error: PlanningCenterClient.formatError(err, 'Services') });
+          }
+        }
+
+        previewOperations.delete(parsed.previewToken);
+        const operationId = `confirm_position_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+        saveAuditOperation({
+          operationId,
+          kind: 'confirm_position',
+          appliedAt: new Date().toISOString(),
+          sourcePreviewToken: parsed.previewToken,
+          applied,
+          skipped,
+          errors,
+        });
+
+        return JSON.stringify(toolSuccess({
+          operationId,
+          sourcePreviewToken: parsed.previewToken,
+          attempted: op.changes.length,
+          appliedCount: applied.length,
+          skippedCount: skipped.length,
+          errorCount: errors.length,
+          applied,
+          skipped,
+          errors,
+        }, {
+          count: applied.length,
+          pcoEndpoint: '/services/v2/service_types/*/plans/*/team_members/*',
+          executionMs: Date.now() - start,
+        }));
+      }
+
+      // -----------------------------------------------------------------
+      // 6. create_plan — POST a new plan
+      // -----------------------------------------------------------------
+      case 'pco_preview_create_plan': {
+        const schema = z.object({
+          serviceTypeId: z.string(),
+          sortDate: z.string(),
+          title: z.string().optional(),
+          seriesTitle: z.string().optional(),
+        });
+        const parsed = schema.parse(args);
+
+        const writableError = validateWritableTargets([parsed.serviceTypeId]);
+        if (writableError) return JSON.stringify(toolError(writableError));
+
+        const plansEndpoint = `/services/v2/service_types/${parsed.serviceTypeId}/plans`;
+        const attributes: Record<string, unknown> = { sort_date: parsed.sortDate };
+        if (parsed.title !== undefined) attributes.title = parsed.title;
+        if (parsed.seriesTitle !== undefined) attributes.series_title = parsed.seriesTitle;
+
+        const applyBody = { data: { type: 'Plan', attributes } };
+
+        const change: PreviewChange = {
+          serviceTypeId: parsed.serviceTypeId,
+          planId: '',
+          planDate: parsed.sortDate,
+          itemId: '',
+          beforeAttributes: {},
+          afterAttributes: attributes,
+          reason: `Create plan in service type ${parsed.serviceTypeId} for ${parsed.sortDate}`,
+          applyMethod: 'POST',
+          applyEndpoint: plansEndpoint,
+          applyBody,
+          rollbackMethod: 'DELETE',
+          // rollbackEndpoint set on apply once planId is known
+        };
+
+        const op = createPreviewOperation('create_plan', [change], {
+          serviceTypeId: parsed.serviceTypeId,
+          sortDate: parsed.sortDate,
+          title: parsed.title ?? null,
+          seriesTitle: parsed.seriesTitle ?? null,
+          note: 'Rollback DELETEs the plan; PCO may refuse if the plan has items or people scheduled.',
+        });
+
+        return JSON.stringify(toolSuccess({
+          previewToken: op.token,
+          createdAt: op.createdAt,
+          expiresAt: op.expiresAt,
+          totalChanges: 1,
+          summary: summarizePreviewChanges([change]),
+          changes: [change],
+        }, {
+          count: 1,
+          pcoEndpoint: plansEndpoint,
+          executionMs: Date.now() - start,
+        }));
+      }
+
+      case 'pco_apply_create_plan': {
+        const schema = z.object({
+          previewToken: z.string(),
+          confirmPhrase: z.literal('APPLY_CHANGES'),
+        });
+        const parsed = schema.parse(args);
+        const op = getPreviewOperation(parsed.previewToken, 'create_plan');
+        if (!op) return JSON.stringify(toolError('Invalid or expired previewToken for create_plan operation. Run preview again.'));
+
+        const writableError = validateWritableTargets(op.changes.map((change) => change.serviceTypeId));
+        if (writableError) return JSON.stringify(toolError(writableError));
+
+        const applied: PreviewChange[] = [];
+        const skipped: Array<Record<string, unknown>> = [];
+        const errors: Array<Record<string, unknown>> = [];
+
+        for (const change of op.changes) {
+          try {
+            const result = await client.post<any>(change.applyEndpoint as string, change.applyBody);
+            const createdId = String(result?.data?.id ?? '');
+            const appliedChange: PreviewChange = {
+              ...change,
+              planId: createdId || change.planId,
+              createdResourceId: createdId,
+              createdResourceType: 'Plan',
+              rollbackEndpoint: createdId
+                ? `${change.applyEndpoint}/${createdId}`
+                : undefined,
+              rollbackMethod: createdId ? 'DELETE' : 'NONE',
+            };
+            applied.push(appliedChange);
+          } catch (err) {
+            errors.push({ ...change, error: PlanningCenterClient.formatError(err, 'Services') });
+          }
+        }
+
+        previewOperations.delete(parsed.previewToken);
+        const operationId = `create_plan_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
+        saveAuditOperation({
+          operationId,
+          kind: 'create_plan',
+          appliedAt: new Date().toISOString(),
+          sourcePreviewToken: parsed.previewToken,
+          applied,
+          skipped,
+          errors,
+        });
+
+        return JSON.stringify(toolSuccess({
+          operationId,
+          sourcePreviewToken: parsed.previewToken,
+          attempted: op.changes.length,
+          appliedCount: applied.length,
+          skippedCount: skipped.length,
+          errorCount: errors.length,
+          applied,
+          skipped,
+          errors,
+        }, {
+          count: applied.length,
+          pcoEndpoint: '/services/v2/service_types/*/plans',
+          executionMs: Date.now() - start,
+        }));
+      }
+
       case 'pco_get_plan_times_detailed': {
         const schema = z.object({
           serviceTypeId: z.string(),
@@ -1182,6 +2091,12 @@ export async function handleServicesTool(
           return JSON.stringify(toolError('Unknown operationId (or it has expired from audit history).'));
         }
 
+        if (operation.irreversible) {
+          return JSON.stringify(toolError(
+            `This operation type is irreversible. Audit only.${operation.irreversibleReason ? ` Reason: ${operation.irreversibleReason}` : ''}`
+          ));
+        }
+
         if (operation.applied.length > parsed.maxChanges) {
           return JSON.stringify(toolError(`Operation has ${operation.applied.length} applied changes, exceeding maxChanges=${parsed.maxChanges}.`));
         }
@@ -1196,9 +2111,11 @@ export async function handleServicesTool(
         const errors: Array<Record<string, unknown>> = [];
 
         for (const change of operation.applied) {
+          // New kinds carry explicit rollback metadata; legacy kinds fall back to PATCH item with beforeAttributes.
+          const useGenericRollback = Boolean(change.rollbackMethod && change.rollbackEndpoint);
           const itemEndpoint = `/services/v2/service_types/${change.serviceTypeId}/plans/${change.planId}/items/${change.itemId}`;
           try {
-            if (parsed.requireCurrentValueMatch) {
+            if (!useGenericRollback && parsed.requireCurrentValueMatch) {
               const current = await client.get<any>(itemEndpoint);
               const currentFlat = current?.data ? client.flatten(current.data) : null;
               let mismatch = false;
@@ -1214,12 +2131,29 @@ export async function handleServicesTool(
               }
             }
 
-            await client.patch(itemEndpoint, {
-              data: {
-                type: 'Item',
-                attributes: change.beforeAttributes,
-              },
-            });
+            if (useGenericRollback) {
+              const method = change.rollbackMethod;
+              const endpoint = change.rollbackEndpoint as string;
+              if (method === 'NONE') {
+                skipped.push({ ...change, reason: 'No rollback action recorded for this change.' });
+                continue;
+              }
+              if (method === 'DELETE') {
+                await client.delete(endpoint);
+              } else if (method === 'POST') {
+                await client.post(endpoint, change.rollbackBody ?? {});
+              } else {
+                // default PATCH
+                await client.patch(endpoint, change.rollbackBody ?? { data: { type: 'Item', attributes: change.beforeAttributes } });
+              }
+            } else {
+              await client.patch(itemEndpoint, {
+                data: {
+                  type: 'Item',
+                  attributes: change.beforeAttributes,
+                },
+              });
+            }
             rolledBack.push(change);
           } catch (err) {
             errors.push({
@@ -1484,7 +2418,7 @@ export function getServicesToolDefinitions() {
     {
       name: 'pco_rollback_services_write_operation',
       description:
-        'Rollback a prior Services write operation by restoring each changed item to its previous values.',
+        'Rollback a prior Services write operation by restoring each changed item to its previous values. Refuses for irreversible operations (e.g. schedule_position, which has already sent a notification email).',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -1494,6 +2428,178 @@ export function getServicesToolDefinitions() {
           requireCurrentValueMatch: { type: 'boolean', description: 'Skip if current item no longer matches applied state (default true)' },
         },
         required: ['operationId', 'confirmPhrase'],
+      },
+    },
+    {
+      name: 'pco_preview_add_song_to_plan',
+      description:
+        'Preview inserting a song item at the given position (1-based sequence) on a service plan. Dry-run only — returns previewToken and the planned insertion. Apply via pco_apply_add_song_to_plan.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          serviceTypeId: { type: 'string', description: 'The service type ID' },
+          planId: { type: 'string', description: 'The plan ID' },
+          songId: { type: 'string', description: 'The PCO Song ID to add' },
+          position: { type: 'number', description: 'Target sequence position (1-based)' },
+          arrangementId: { type: 'string', description: 'Optional arrangement ID' },
+          key: { type: 'string', description: 'Optional key name (e.g. "G", "Am")' },
+        },
+        required: ['serviceTypeId', 'planId', 'songId', 'position'],
+      },
+    },
+    {
+      name: 'pco_apply_add_song_to_plan',
+      description:
+        'Apply a previewed add_song operation, inserting the song into the plan items. Reversible via pco_rollback_services_write_operation (DELETEs the created item).',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          previewToken: { type: 'string', description: 'Token from pco_preview_add_song_to_plan' },
+          confirmPhrase: { type: 'string', enum: ['APPLY_CHANGES'], description: 'Safety confirmation phrase' },
+        },
+        required: ['previewToken', 'confirmPhrase'],
+      },
+    },
+    {
+      name: 'pco_preview_reorder_plan_items',
+      description:
+        'Preview reordering plan items by passing the full list of item IDs in the desired order. Dry-run — returns previewToken and per-item sequence diffs.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          serviceTypeId: { type: 'string', description: 'The service type ID' },
+          planId: { type: 'string', description: 'The plan ID' },
+          itemIdsInOrder: { type: 'array', items: { type: 'string' }, description: 'Item IDs in the desired final order' },
+        },
+        required: ['serviceTypeId', 'planId', 'itemIdsInOrder'],
+      },
+    },
+    {
+      name: 'pco_apply_reorder_plan_items',
+      description:
+        'Apply a previewed reorder operation, PATCHing each item to its new sequence. Reversible via pco_rollback_services_write_operation.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          previewToken: { type: 'string', description: 'Token from pco_preview_reorder_plan_items' },
+          confirmPhrase: { type: 'string', enum: ['APPLY_CHANGES'], description: 'Safety confirmation phrase' },
+        },
+        required: ['previewToken', 'confirmPhrase'],
+      },
+    },
+    {
+      name: 'pco_preview_set_item_key_or_tempo',
+      description:
+        'Preview updating a song item\'s key, length, or arrangement. Dry-run — returns previewToken and diff.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          serviceTypeId: { type: 'string', description: 'The service type ID' },
+          planId: { type: 'string', description: 'The plan ID' },
+          itemId: { type: 'string', description: 'The item ID' },
+          key: { type: 'string', description: 'Optional new key name' },
+          length: { type: 'number', description: 'Optional new length in seconds' },
+          arrangementId: { type: 'string', description: 'Optional new arrangement ID' },
+        },
+        required: ['serviceTypeId', 'planId', 'itemId'],
+      },
+    },
+    {
+      name: 'pco_apply_set_item_key_or_tempo',
+      description:
+        'Apply a previewed song-item key/length/arrangement change. Reversible via pco_rollback_services_write_operation.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          previewToken: { type: 'string', description: 'Token from pco_preview_set_item_key_or_tempo' },
+          confirmPhrase: { type: 'string', enum: ['APPLY_CHANGES'], description: 'Safety confirmation phrase' },
+        },
+        required: ['previewToken', 'confirmPhrase'],
+      },
+    },
+    {
+      name: 'pco_preview_schedule_position',
+      description:
+        'Preview scheduling a person to a team position for a plan. IRREVERSIBLE — applying will send a notification email to the volunteer. Preview shows recipient, position, and plan date.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          serviceTypeId: { type: 'string', description: 'The service type ID' },
+          planId: { type: 'string', description: 'The plan ID' },
+          teamId: { type: 'string', description: 'The team ID' },
+          personId: { type: 'string', description: 'The person ID' },
+          positionName: { type: 'string', description: 'The position name on the team' },
+        },
+        required: ['serviceTypeId', 'planId', 'teamId', 'personId', 'positionName'],
+      },
+    },
+    {
+      name: 'pco_apply_schedule_position',
+      description:
+        'Apply a previewed schedule_position operation. IRREVERSIBLE — PCO sends a notification email to the volunteer. Rollback will refuse with an irreversibility error.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          previewToken: { type: 'string', description: 'Token from pco_preview_schedule_position' },
+          confirmPhrase: { type: 'string', enum: ['APPLY_CHANGES'], description: 'Safety confirmation phrase' },
+        },
+        required: ['previewToken', 'confirmPhrase'],
+      },
+    },
+    {
+      name: 'pco_preview_confirm_or_decline_position',
+      description:
+        'Preview setting a PlanPerson status to C (confirmed) or D (declined). Reversible. Dry-run — returns previewToken and before/after status.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          serviceTypeId: { type: 'string', description: 'The service type ID' },
+          planId: { type: 'string', description: 'The plan ID' },
+          planPersonId: { type: 'string', description: 'The PlanPerson (team_members) ID' },
+          status: { type: 'string', enum: ['C', 'D'], description: 'C=confirmed, D=declined' },
+        },
+        required: ['serviceTypeId', 'planId', 'planPersonId', 'status'],
+      },
+    },
+    {
+      name: 'pco_apply_confirm_or_decline_position',
+      description:
+        'Apply a previewed confirm/decline operation, PATCHing the PlanPerson status. Reversible via pco_rollback_services_write_operation.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          previewToken: { type: 'string', description: 'Token from pco_preview_confirm_or_decline_position' },
+          confirmPhrase: { type: 'string', enum: ['APPLY_CHANGES'], description: 'Safety confirmation phrase' },
+        },
+        required: ['previewToken', 'confirmPhrase'],
+      },
+    },
+    {
+      name: 'pco_preview_create_plan',
+      description:
+        'Preview creating a new service plan. Dry-run — returns previewToken and the planned attributes.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          serviceTypeId: { type: 'string', description: 'The service type ID' },
+          sortDate: { type: 'string', description: 'ISO date for sort_date (e.g. "2026-06-07T16:00:00Z")' },
+          title: { type: 'string', description: 'Optional plan title' },
+          seriesTitle: { type: 'string', description: 'Optional series title' },
+        },
+        required: ['serviceTypeId', 'sortDate'],
+      },
+    },
+    {
+      name: 'pco_apply_create_plan',
+      description:
+        'Apply a previewed create_plan operation. Reversible via pco_rollback_services_write_operation (DELETE the created plan). PCO may refuse the DELETE if the plan has items or people scheduled.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          previewToken: { type: 'string', description: 'Token from pco_preview_create_plan' },
+          confirmPhrase: { type: 'string', enum: ['APPLY_CHANGES'], description: 'Safety confirmation phrase' },
+        },
+        required: ['previewToken', 'confirmPhrase'],
       },
     },
   ];

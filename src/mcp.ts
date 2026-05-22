@@ -8,6 +8,7 @@ import {
 import { PlanningCenterClient } from './client.js';
 import { PCO_CONTEXT_CONTENT, PCO_CONTEXT_PROMPT, PCO_ONBOARDING_CONTENT, PCO_ONBOARDING_PROMPT } from './prompts/pco-context.js';
 import { getAnalyticsToolDefinitions, handleAnalyticsTool } from './tools/analytics.js';
+import { getCalendarToolDefinitions, handleCalendarTool } from './tools/calendar.js';
 import { getCapabilitiesToolDefinitions, handleCapabilitiesTool } from './tools/capabilities.js';
 import { getCheckInsToolDefinitions, handleCheckInsTool } from './tools/checkins.js';
 import { getGivingToolDefinitions, handleGivingTool } from './tools/giving.js';
@@ -47,6 +48,7 @@ export function createPlanningCenterMcpServer(client: PlanningCenterClient, work
     ...getAnalyticsToolDefinitions(),
     ...getWorkflowToolDefinitions(),
     ...getCapabilitiesToolDefinitions(),
+    ...getCalendarToolDefinitions(),
   ];
 
   const servicesTools = new Set(getServicesToolDefinitions().map((tool) => tool.name));
@@ -58,6 +60,7 @@ export function createPlanningCenterMcpServer(client: PlanningCenterClient, work
   const analyticsTools = new Set(getAnalyticsToolDefinitions().map((tool) => tool.name));
   const workflowTools = new Set(getWorkflowToolDefinitions().map((tool) => tool.name));
   const capabilitiesTools = new Set(getCapabilitiesToolDefinitions().map((tool) => tool.name));
+  const calendarTools = new Set(getCalendarToolDefinitions().map((tool) => tool.name));
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: allTools }));
 
@@ -83,6 +86,8 @@ export function createPlanningCenterMcpServer(client: PlanningCenterClient, work
       result = await handleWorkflowTool(name, args as Record<string, unknown>, client, workflowContext);
     } else if (capabilitiesTools.has(name)) {
       result = await handleCapabilitiesTool(name);
+    } else if (calendarTools.has(name)) {
+      result = await handleCalendarTool(name, args as Record<string, unknown>, client);
     } else {
       result = JSON.stringify({
         success: false,
