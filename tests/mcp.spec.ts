@@ -900,3 +900,516 @@ test('summarizes preview, audits writes, and rolls back operation', async () => 
     await mock.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Groups write-tool tests (Phase 3)
+// ---------------------------------------------------------------------------
+
+test('groups add_to_group: preview → apply → rollback (and allowlist rejection)', async () => {
+  const memberships = new Map<string, { id: string; role: string; personId: string }>();
+  let nextMembershipId = 100;
+
+  const mock = await startMockPco((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    const url = req.url ?? '';
+    const method = req.method ?? 'GET';
+
+    // POST membership
+    const postMatch = url.match(/^\/groups\/v2\/groups\/([^/]+)\/memberships$/);
+    if (postMatch && method === 'POST') {
+      let raw = '';
+      req.on('data', (chunk) => { raw += chunk.toString('utf8'); });
+      req.on('end', () => {
+        const body = JSON.parse(raw) as { data: { attributes: { role: string }; relationships: { person: { data: { id: string } } } } };
+        const id = `mem-${nextMembershipId++}`;
+        memberships.set(id, {
+          id,
+          role: body.data.attributes.role,
+          personId: body.data.relationships.person.data.id,
+        });
+        res.end(JSON.stringify({
+          data: { id, type: 'GroupMembership', attributes: { role: body.data.attributes.role } },
+        }));
+      });
+      return;
+    }
+
+    // DELETE membership
+    const delMatch = url.match(/^\/groups\/v2\/groups\/([^/]+)\/memberships\/([^/?]+)$/);
+    if (delMatch && method === 'DELETE') {
+      memberships.delete(delMatch[2]);
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end(JSON.stringify({ errors: [{ detail: 'not found' }] }));
+  });
+
+  const mcp = new McpProcess({
+    PCO_APP_ID: 'test-id',
+    PCO_SECRET: 'test-secret',
+    PCO_BASE_URL: mock.url,
+    PCO_WRITABLE_GROUP_IDS: 'group-1',
+  });
+
+  try {
+    await mcp.initialize();
+
+    // Rejection case: non-allowlisted group
+    const rejected = await mcp.request('tools/call', {
+      name: 'pco_preview_add_to_group',
+      arguments: { groupId: 'group-99', personId: 'person-1' },
+    }, 1001);
+    const rejectedPayload = JSON.parse((rejected.result as any).content[0].text) as { success: boolean; error: string };
+    expect(rejectedPayload.success).toBe(false);
+    expect(rejectedPayload.error).toContain('group-99');
+
+    // Preview
+    const preview = await mcp.request('tools/call', {
+      name: 'pco_preview_add_to_group',
+      arguments: { groupId: 'group-1', personId: 'person-1', role: 'leader' },
+    }, 1002);
+    const previewPayload = JSON.parse((preview.result as any).content[0].text) as {
+      success: boolean;
+      data: { previewToken: string; totalChanges: number };
+    };
+    expect(previewPayload.success).toBe(true);
+    expect(previewPayload.data.totalChanges).toBe(1);
+
+    // Apply
+    const apply = await mcp.request('tools/call', {
+      name: 'pco_apply_add_to_group',
+      arguments: { previewToken: previewPayload.data.previewToken, confirmPhrase: 'APPLY_CHANGES' },
+    }, 1003);
+    const applyPayload = JSON.parse((apply.result as any).content[0].text) as {
+      success: boolean;
+      data: { operationId: string; appliedCount: number; errorCount: number };
+    };
+    expect(applyPayload.success).toBe(true);
+    expect(applyPayload.data.appliedCount).toBe(1);
+    expect(applyPayload.data.errorCount).toBe(0);
+    expect(memberships.size).toBe(1);
+
+    // Rollback
+    const rollback = await mcp.request('tools/call', {
+      name: 'pco_rollback_groups_write_operation',
+      arguments: { operationId: applyPayload.data.operationId, confirmPhrase: 'ROLLBACK_CHANGES' },
+    }, 1004);
+    const rollbackPayload = JSON.parse((rollback.result as any).content[0].text) as {
+      success: boolean;
+      data: { rolledBackCount: number };
+    };
+    expect(rollbackPayload.success).toBe(true);
+    expect(rollbackPayload.data.rolledBackCount).toBe(1);
+    expect(memberships.size).toBe(0);
+  } finally {
+    await mcp.close();
+    await mock.close();
+  }
+});
+
+test('groups remove_from_group: preview reads current → apply DELETE → rollback POSTs back', async () => {
+  const memberships = new Map<string, { role: string; personId: string }>([
+    ['mem-1', { role: 'leader', personId: 'person-1' }],
+  ]);
+  let postCount = 0;
+
+  const mock = await startMockPco((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    const url = req.url ?? '';
+    const method = req.method ?? 'GET';
+
+    const getOne = url.match(/^\/groups\/v2\/groups\/([^/]+)\/memberships\/([^/?]+)(\?|$)/);
+    if (getOne && method === 'GET') {
+      const m = memberships.get(getOne[2]);
+      if (!m) {
+        res.statusCode = 404;
+        res.end(JSON.stringify({ errors: [{ detail: 'not found' }] }));
+        return;
+      }
+      res.end(JSON.stringify({
+        data: {
+          id: getOne[2],
+          type: 'GroupMembership',
+          attributes: { role: m.role },
+          relationships: { person: { data: { type: 'Person', id: m.personId } } },
+        },
+      }));
+      return;
+    }
+
+    if (getOne && method === 'DELETE') {
+      memberships.delete(getOne[2]);
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
+
+    const post = url.match(/^\/groups\/v2\/groups\/([^/]+)\/memberships$/);
+    if (post && method === 'POST') {
+      let raw = '';
+      req.on('data', (chunk) => { raw += chunk.toString('utf8'); });
+      req.on('end', () => {
+        const body = JSON.parse(raw) as { data: { attributes: { role: string }; relationships: { person: { data: { id: string } } } } };
+        postCount++;
+        const id = `mem-restored-${postCount}`;
+        memberships.set(id, {
+          role: body.data.attributes.role,
+          personId: body.data.relationships.person.data.id,
+        });
+        res.end(JSON.stringify({
+          data: { id, type: 'GroupMembership', attributes: { role: body.data.attributes.role } },
+        }));
+      });
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end(JSON.stringify({ errors: [{ detail: 'not found' }] }));
+  });
+
+  const mcp = new McpProcess({
+    PCO_APP_ID: 'test-id',
+    PCO_SECRET: 'test-secret',
+    PCO_BASE_URL: mock.url,
+    PCO_WRITABLE_GROUP_IDS: 'group-1',
+  });
+
+  try {
+    await mcp.initialize();
+    const preview = await mcp.request('tools/call', {
+      name: 'pco_preview_remove_from_group',
+      arguments: { groupId: 'group-1', membershipId: 'mem-1' },
+    }, 1101);
+    const previewPayload = JSON.parse((preview.result as any).content[0].text) as {
+      success: boolean;
+      data: { previewToken: string; changes: Array<{ beforeAttributes: { role: string; personId: string } }> };
+    };
+    expect(previewPayload.success).toBe(true);
+    expect(previewPayload.data.changes[0].beforeAttributes.role).toBe('leader');
+    expect(previewPayload.data.changes[0].beforeAttributes.personId).toBe('person-1');
+
+    const apply = await mcp.request('tools/call', {
+      name: 'pco_apply_remove_from_group',
+      arguments: { previewToken: previewPayload.data.previewToken, confirmPhrase: 'APPLY_CHANGES' },
+    }, 1102);
+    const applyPayload = JSON.parse((apply.result as any).content[0].text) as {
+      success: boolean;
+      data: { operationId: string; appliedCount: number };
+    };
+    expect(applyPayload.success).toBe(true);
+    expect(applyPayload.data.appliedCount).toBe(1);
+    expect(memberships.has('mem-1')).toBe(false);
+
+    const rollback = await mcp.request('tools/call', {
+      name: 'pco_rollback_groups_write_operation',
+      arguments: { operationId: applyPayload.data.operationId, confirmPhrase: 'ROLLBACK_CHANGES' },
+    }, 1103);
+    const rollbackPayload = JSON.parse((rollback.result as any).content[0].text) as {
+      success: boolean;
+      data: { rolledBackCount: number };
+    };
+    expect(rollbackPayload.success).toBe(true);
+    expect(rollbackPayload.data.rolledBackCount).toBe(1);
+    expect(postCount).toBe(1);
+  } finally {
+    await mcp.close();
+    await mock.close();
+  }
+});
+
+test('groups log_group_attendance: preview → apply → rollback', async () => {
+  const attendances = new Map<string, { attended: boolean; personId: string }>();
+  let nextAttendanceId = 1;
+
+  const mock = await startMockPco((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    const url = req.url ?? '';
+    const method = req.method ?? 'GET';
+
+    // Look up event → resolve group
+    if (url.match(/^\/groups\/v2\/events\/event-1(\?|$)/) && method === 'GET') {
+      res.end(JSON.stringify({
+        data: {
+          id: 'event-1',
+          type: 'Event',
+          attributes: { starts_at: '2026-05-22T18:00:00Z' },
+          relationships: { group: { data: { type: 'Group', id: 'group-1' } } },
+        },
+      }));
+      return;
+    }
+
+    if (url.match(/^\/groups\/v2\/events\/event-1\/attendances$/) && method === 'POST') {
+      let raw = '';
+      req.on('data', (chunk) => { raw += chunk.toString('utf8'); });
+      req.on('end', () => {
+        const body = JSON.parse(raw) as { data: { attributes: { attended: boolean }; relationships: { person: { data: { id: string } } } } };
+        const id = `att-${nextAttendanceId++}`;
+        attendances.set(id, {
+          attended: body.data.attributes.attended,
+          personId: body.data.relationships.person.data.id,
+        });
+        res.end(JSON.stringify({
+          data: { id, type: 'Attendance', attributes: { attended: body.data.attributes.attended } },
+        }));
+      });
+      return;
+    }
+
+    const delMatch = url.match(/^\/groups\/v2\/events\/event-1\/attendances\/([^/?]+)$/);
+    if (delMatch && method === 'DELETE') {
+      attendances.delete(delMatch[1]);
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end(JSON.stringify({ errors: [{ detail: 'not found' }] }));
+  });
+
+  const mcp = new McpProcess({
+    PCO_APP_ID: 'test-id',
+    PCO_SECRET: 'test-secret',
+    PCO_BASE_URL: mock.url,
+    PCO_WRITABLE_GROUP_IDS: 'group-1',
+  });
+
+  try {
+    await mcp.initialize();
+    const preview = await mcp.request('tools/call', {
+      name: 'pco_preview_log_group_attendance',
+      arguments: { eventId: 'event-1', personIds: ['person-1', 'person-2'], attendance: true },
+    }, 1201);
+    const previewPayload = JSON.parse((preview.result as any).content[0].text) as {
+      success: boolean;
+      data: { previewToken: string; totalChanges: number };
+    };
+    expect(previewPayload.success).toBe(true);
+    expect(previewPayload.data.totalChanges).toBe(2);
+
+    const apply = await mcp.request('tools/call', {
+      name: 'pco_apply_log_group_attendance',
+      arguments: { previewToken: previewPayload.data.previewToken, confirmPhrase: 'APPLY_CHANGES' },
+    }, 1202);
+    const applyPayload = JSON.parse((apply.result as any).content[0].text) as {
+      success: boolean;
+      data: { operationId: string; appliedCount: number };
+    };
+    expect(applyPayload.success).toBe(true);
+    expect(applyPayload.data.appliedCount).toBe(2);
+    expect(attendances.size).toBe(2);
+
+    const rollback = await mcp.request('tools/call', {
+      name: 'pco_rollback_groups_write_operation',
+      arguments: { operationId: applyPayload.data.operationId, confirmPhrase: 'ROLLBACK_CHANGES' },
+    }, 1203);
+    const rollbackPayload = JSON.parse((rollback.result as any).content[0].text) as {
+      success: boolean;
+      data: { rolledBackCount: number };
+    };
+    expect(rollbackPayload.success).toBe(true);
+    expect(rollbackPayload.data.rolledBackCount).toBe(2);
+    expect(attendances.size).toBe(0);
+  } finally {
+    await mcp.close();
+    await mock.close();
+  }
+});
+
+test('groups send_group_email: preview lists recipients; apply returns not-supported; rollback refuses', async () => {
+  const mock = await startMockPco((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    const url = req.url ?? '';
+    const method = req.method ?? 'GET';
+
+    if (url.startsWith('/groups/v2/groups/group-1/memberships') && method === 'GET') {
+      res.end(JSON.stringify({
+        data: [
+          {
+            id: 'mem-1',
+            type: 'GroupMembership',
+            attributes: { role: 'leader' },
+            relationships: { person: { data: { id: 'person-1', type: 'Person' } } },
+          },
+          {
+            id: 'mem-2',
+            type: 'GroupMembership',
+            attributes: { role: 'member' },
+            relationships: { person: { data: { id: 'person-2', type: 'Person' } } },
+          },
+        ],
+        included: [
+          { id: 'person-1', type: 'Person', attributes: { name: 'Ada Lovelace', email: 'ada@example.test' } },
+          { id: 'person-2', type: 'Person', attributes: { name: 'Grace Hopper', email: 'grace@example.test' } },
+        ],
+        meta: { total_count: 2 },
+      }));
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end(JSON.stringify({ errors: [{ detail: 'not found' }] }));
+  });
+
+  const mcp = new McpProcess({
+    PCO_APP_ID: 'test-id',
+    PCO_SECRET: 'test-secret',
+    PCO_BASE_URL: mock.url,
+    PCO_WRITABLE_GROUP_IDS: 'group-1',
+    PCO_GROUP_EMAIL_ENABLED: 'true',
+  });
+
+  try {
+    await mcp.initialize();
+    const preview = await mcp.request('tools/call', {
+      name: 'pco_preview_send_group_email',
+      arguments: {
+        groupId: 'group-1',
+        subject: 'Hello group',
+        body: 'See you Sunday',
+      },
+    }, 1301);
+    const previewPayload = JSON.parse((preview.result as any).content[0].text) as {
+      success: boolean;
+      data: {
+        previewToken: string;
+        summary: { recipientCount: number; recipients: Array<{ name: string; email: string }>; irreversible: boolean };
+      };
+    };
+    expect(previewPayload.success).toBe(true);
+    expect(previewPayload.data.summary.recipientCount).toBe(2);
+    expect(previewPayload.data.summary.recipients[0].name).toBe('Ada Lovelace');
+    expect(previewPayload.data.summary.recipients[0].email).toBe('ada@example.test');
+    expect(previewPayload.data.summary.irreversible).toBe(true);
+
+    // Apply: PCO API doesn't support; expect toolError
+    const apply = await mcp.request('tools/call', {
+      name: 'pco_apply_send_group_email',
+      arguments: { previewToken: previewPayload.data.previewToken, confirmPhrase: 'APPLY_CHANGES' },
+    }, 1302);
+    const applyPayload = JSON.parse((apply.result as any).content[0].text) as { success: boolean; error: string };
+    expect(applyPayload.success).toBe(false);
+    expect(applyPayload.error).toContain('mass-email');
+
+    // Audit log should contain an irreversible entry
+    const audit = await mcp.request('tools/call', {
+      name: 'pco_get_groups_write_audit_log',
+      arguments: { limit: 5 },
+    }, 1303);
+    const auditPayload = JSON.parse((audit.result as any).content[0].text) as {
+      success: boolean;
+      data: { operations: Array<{ kind: string; irreversible: boolean; operationId: string }> };
+    };
+    expect(auditPayload.success).toBe(true);
+    const emailOps = auditPayload.data.operations.filter((op) => op.kind === 'groups_send_group_email');
+    expect(emailOps.length).toBeGreaterThanOrEqual(1);
+    expect(emailOps[0].irreversible).toBe(true);
+
+    // Rollback should refuse
+    const rollback = await mcp.request('tools/call', {
+      name: 'pco_rollback_groups_write_operation',
+      arguments: { operationId: emailOps[0].operationId, confirmPhrase: 'ROLLBACK_CHANGES' },
+    }, 1304);
+    const rollbackPayload = JSON.parse((rollback.result as any).content[0].text) as { success: boolean; error: string };
+    expect(rollbackPayload.success).toBe(false);
+    expect(rollbackPayload.error).toMatch(/irreversible|mass-email|public API/i);
+  } finally {
+    await mcp.close();
+    await mock.close();
+  }
+});
+
+test('groups create_group_meeting: preview → apply → rollback deletes event', async () => {
+  const events = new Map<string, Record<string, unknown>>();
+  let nextEventId = 500;
+
+  const mock = await startMockPco((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    const url = req.url ?? '';
+    const method = req.method ?? 'GET';
+
+    const post = url.match(/^\/groups\/v2\/groups\/([^/]+)\/events$/);
+    if (post && method === 'POST') {
+      let raw = '';
+      req.on('data', (chunk) => { raw += chunk.toString('utf8'); });
+      req.on('end', () => {
+        const body = JSON.parse(raw) as { data: { attributes: Record<string, unknown> } };
+        const id = `evt-${nextEventId++}`;
+        events.set(id, body.data.attributes);
+        res.end(JSON.stringify({
+          data: { id, type: 'Event', attributes: body.data.attributes },
+        }));
+      });
+      return;
+    }
+
+    const del = url.match(/^\/groups\/v2\/groups\/([^/]+)\/events\/([^/?]+)$/);
+    if (del && method === 'DELETE') {
+      events.delete(del[2]);
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end(JSON.stringify({ errors: [{ detail: 'not found' }] }));
+  });
+
+  const mcp = new McpProcess({
+    PCO_APP_ID: 'test-id',
+    PCO_SECRET: 'test-secret',
+    PCO_BASE_URL: mock.url,
+    PCO_WRITABLE_GROUP_IDS: 'group-1',
+  });
+
+  try {
+    await mcp.initialize();
+    const preview = await mcp.request('tools/call', {
+      name: 'pco_preview_create_group_meeting',
+      arguments: {
+        groupId: 'group-1',
+        startsAt: '2026-06-01T18:00:00Z',
+        endsAt: '2026-06-01T20:00:00Z',
+        name: 'June Kickoff',
+        locationName: 'Living Room',
+      },
+    }, 1401);
+    const previewPayload = JSON.parse((preview.result as any).content[0].text) as {
+      success: boolean;
+      data: { previewToken: string; totalChanges: number };
+    };
+    expect(previewPayload.success).toBe(true);
+    expect(previewPayload.data.totalChanges).toBe(1);
+
+    const apply = await mcp.request('tools/call', {
+      name: 'pco_apply_create_group_meeting',
+      arguments: { previewToken: previewPayload.data.previewToken, confirmPhrase: 'APPLY_CHANGES' },
+    }, 1402);
+    const applyPayload = JSON.parse((apply.result as any).content[0].text) as {
+      success: boolean;
+      data: { operationId: string; appliedCount: number };
+    };
+    expect(applyPayload.success).toBe(true);
+    expect(applyPayload.data.appliedCount).toBe(1);
+    expect(events.size).toBe(1);
+
+    const rollback = await mcp.request('tools/call', {
+      name: 'pco_rollback_groups_write_operation',
+      arguments: { operationId: applyPayload.data.operationId, confirmPhrase: 'ROLLBACK_CHANGES' },
+    }, 1403);
+    const rollbackPayload = JSON.parse((rollback.result as any).content[0].text) as {
+      success: boolean;
+      data: { rolledBackCount: number };
+    };
+    expect(rollbackPayload.success).toBe(true);
+    expect(rollbackPayload.data.rolledBackCount).toBe(1);
+    expect(events.size).toBe(0);
+  } finally {
+    await mcp.close();
+    await mock.close();
+  }
+});
