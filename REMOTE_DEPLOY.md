@@ -61,7 +61,7 @@ Start Command: node dist/remote.js
 5. Add environment variables:
 
 ```env
-NODE_VERSION=20
+NODE_VERSION=22
 PUBLIC_BASE_URL=https://YOUR-HOST
 DATABASE_URL=your_neon_connection_string
 TOKEN_ENCRYPTION_KEY=generate_a_long_random_secret
