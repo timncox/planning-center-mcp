@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import { and, eq, isNull } from 'drizzle-orm';
 import axios from 'axios';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -10,7 +10,9 @@ import { fileURLToPath } from 'node:url';
 import { URL } from 'node:url';
 import dotenv from 'dotenv';
 import { PlanningCenterClient } from './client.js';
-import { SupabaseFeedbackStore } from './feedback.js';
+import { getDb } from './db/index.js';
+import { connectorTokens, pcoConnections } from './db/schema.js';
+import { NeonFeedbackStore } from './feedback.js';
 import { createPlanningCenterMcpServer } from './mcp.js';
 
 dotenv.config();
@@ -41,12 +43,6 @@ function requiredEnv(name: string) {
   const value = process.env[name];
   if (!value) throw new Error(`Missing required environment variable: ${name}`);
   return value;
-}
-
-function getSupabase(): SupabaseClient {
-  return createClient(requiredEnv('SUPABASE_URL'), requiredEnv('SUPABASE_SERVICE_ROLE_KEY'), {
-    auth: { persistSession: false },
-  });
 }
 
 function encryptionKey() {
@@ -168,36 +164,45 @@ async function refreshAccessToken(connection: PcoConnectionRow): Promise<string>
 
   const token = response.data;
   const expiresAt = token.expires_in
-    ? new Date(Date.now() + token.expires_in * 1000).toISOString()
+    ? new Date(Date.now() + token.expires_in * 1000)
     : null;
 
-  await getSupabase()
-    .from('pco_connections')
-    .update({
-      encrypted_access_token: encrypt(token.access_token),
-      encrypted_refresh_token: token.refresh_token ? encrypt(token.refresh_token) : connection.encrypted_refresh_token,
-      expires_at: expiresAt,
-      updated_at: new Date().toISOString(),
+  await getDb()
+    .update(pcoConnections)
+    .set({
+      encryptedAccessToken: encrypt(token.access_token),
+      encryptedRefreshToken: token.refresh_token
+        ? encrypt(token.refresh_token)
+        : connection.encrypted_refresh_token,
+      expiresAt,
+      updatedAt: new Date(),
     })
-    .eq('id', connection.id);
+    .where(eq(pcoConnections.id, connection.id));
 
   return token.access_token;
 }
 
-async function connectionForConnectorToken(rawToken: string) {
-  const supabase = getSupabase();
-  const { data, error } = await supabase
-    .from('connector_tokens')
-    .select('pco_connection_id, revoked_at, pco_connections(id, encrypted_access_token, encrypted_refresh_token, expires_at)')
-    .eq('token_hash', hashToken(rawToken))
-    .maybeSingle();
+async function connectionForConnectorToken(rawToken: string): Promise<PcoConnectionRow | null> {
+  const rows = await getDb()
+    .select({
+      id: pcoConnections.id,
+      encrypted_access_token: pcoConnections.encryptedAccessToken,
+      encrypted_refresh_token: pcoConnections.encryptedRefreshToken,
+      expires_at: pcoConnections.expiresAt,
+    })
+    .from(connectorTokens)
+    .innerJoin(pcoConnections, eq(connectorTokens.pcoConnectionId, pcoConnections.id))
+    .where(and(eq(connectorTokens.tokenHash, hashToken(rawToken)), isNull(connectorTokens.revokedAt)))
+    .limit(1);
 
-  if (error) throw error;
-  if (!data || data.revoked_at) return null;
-  const connection = Array.isArray(data.pco_connections)
-    ? data.pco_connections[0]
-    : data.pco_connections;
-  return connection as PcoConnectionRow | null;
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    id: row.id,
+    encrypted_access_token: row.encrypted_access_token,
+    encrypted_refresh_token: row.encrypted_refresh_token,
+    expires_at: row.expires_at ? row.expires_at.toISOString() : null,
+  };
 }
 
 async function handleOAuthStart(_req: IncomingMessage, res: ServerResponse) {
@@ -225,30 +230,26 @@ async function handleOAuthCallback(url: URL, res: ServerResponse) {
   const me = await pcoClient.get<any>('/people/v2/me');
   const person = pcoClient.flatten(me.data);
   const connectorToken = generateConnectorToken();
-  const expiresAt = token.expires_in ? new Date(Date.now() + token.expires_in * 1000).toISOString() : null;
-  const supabase = getSupabase();
+  const expiresAt = token.expires_in ? new Date(Date.now() + token.expires_in * 1000) : null;
+  const db = getDb();
 
-  const { data: connection, error: connectionError } = await supabase
-    .from('pco_connections')
-    .insert({
-      pco_person_id: person.id,
-      pco_person_name: person.name ?? null,
-      encrypted_access_token: encrypt(token.access_token),
-      encrypted_refresh_token: token.refresh_token ? encrypt(token.refresh_token) : null,
-      expires_at: expiresAt,
+  const personName = typeof person.name === 'string' ? person.name : null;
+  const [connection] = await db
+    .insert(pcoConnections)
+    .values({
+      pcoPersonId: person.id,
+      pcoPersonName: personName,
+      encryptedAccessToken: encrypt(token.access_token),
+      encryptedRefreshToken: token.refresh_token ? encrypt(token.refresh_token) : null,
+      expiresAt,
     })
-    .select('id')
-    .single();
+    .returning({ id: pcoConnections.id });
 
-  if (connectionError) throw connectionError;
-
-  const { error: tokenError } = await supabase.from('connector_tokens').insert({
-    pco_connection_id: connection.id,
-    token_hash: hashToken(connectorToken),
-    name: `Claude connector for ${person.name ?? person.id}`,
+  await db.insert(connectorTokens).values({
+    pcoConnectionId: connection.id,
+    tokenHash: hashToken(connectorToken),
+    name: `Claude connector for ${personName ?? person.id}`,
   });
-
-  if (tokenError) throw tokenError;
 
   const mcpUrl = `${PUBLIC_BASE_URL}/mcp/${connectorToken}`;
   sendHtml(res, 200, `<!doctype html>
@@ -283,7 +284,7 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse, connectorTok
   const pcoClient = PlanningCenterClient.withAccessToken(accessToken);
   const mcpServer = createPlanningCenterMcpServer(pcoClient, {
     connectionId: connection.id,
-    feedbackStore: new SupabaseFeedbackStore(getSupabase()),
+    feedbackStore: new NeonFeedbackStore(getDb()),
   });
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,

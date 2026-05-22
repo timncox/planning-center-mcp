@@ -1,76 +1,52 @@
-# Remote MCP Deployment — CokiStudio Alpha
+# Remote MCP Deployment
 
-This guide gets the hosted Claude Custom Connector running at:
-
-```text
-https://pco-mcp.cokistudio.com
-```
+This guide gets a hosted Claude Custom Connector running. Adapted from paulyerrick's original — swapped to Neon Postgres (was Supabase) while keeping the rest of the architecture intact.
 
 Claude connector URL format:
 
 ```text
-https://pco-mcp.cokistudio.com/mcp/YOUR_CONNECTOR_TOKEN
+https://YOUR-HOST/mcp/YOUR_CONNECTOR_TOKEN
 ```
 
-## 1. Supabase Setup
+## 1. Neon Setup
 
-1. Open Supabase.
-2. Choose your project or create a new one.
-3. Go to **SQL Editor**.
-4. Run the SQL in:
+1. Open [Neon](https://console.neon.tech/) and create a new project (free tier is fine).
+2. Copy the connection string (it looks like `postgresql://user:pass@ep-foo.region.neon.tech/neondb?sslmode=require`) — this becomes `DATABASE_URL`.
+3. From a local checkout of this repo with `DATABASE_URL` set in `.env`, run the migration:
 
-```text
-supabase/schema.sql
+```bash
+pnpm install
+pnpm db:push   # or: pnpm db:migrate
 ```
 
 This creates `pco_connections`, `connector_tokens`, `mcp_audit_logs`, and `service_feedback`.
 
-If you deployed before `service_feedback` existed, rerun the latest schema. It is safe to run multiple times.
-
-5. Go to **Project Settings → API**.
-6. Copy:
-   - Project URL → `SUPABASE_URL`
-   - Service role key → `SUPABASE_SERVICE_ROLE_KEY`
-
-Security note: never put the service role key in frontend code or Claude chat.
+Alternative: paste `drizzle/0000_remarkable_hex.sql` into the Neon SQL Editor.
 
 ## 2. Planning Center OAuth App
 
-Use the Planning Center account `paul@cokistudio.com`.
-
-1. Open:
-
-```text
-https://api.planningcenteronline.com/oauth/applications
-```
-
-2. Create a new OAuth application.
-3. Name:
+1. Open <https://api.planningcenteronline.com/oauth/applications>.
+2. Click **Register your application here**.
+3. **Application type: Confidential** (the form's default; do NOT pick Public — that disables `client_secret`).
+4. Application name: something users will recognize (e.g. `Planning Center MCP`).
+5. Authorization callback URLs:
 
 ```text
-CokiStudio Planning Center MCP
+https://YOUR-HOST/oauth/planning-center/callback
+http://localhost:3000/oauth/planning-center/callback
 ```
 
-4. Redirect URI:
-
-```text
-https://pco-mcp.cokistudio.com/oauth/planning-center/callback
-```
-
-5. Save and copy:
+6. Save, then copy:
    - Client ID → `PCO_CLIENT_ID`
    - Client Secret → `PCO_CLIENT_SECRET`
+
+Note: only Org Admins can register a developer app. New apps start in Development mode (~50 user cap); submit for review when you outgrow it.
 
 ## 3. Render Setup
 
 1. Go to Render.
 2. Click **New → Web Service**.
-3. Connect the GitHub repo:
-
-```text
-paulyerrick/planning-center-mcp
-```
-
+3. Connect your fork of this GitHub repo.
 4. Use these settings:
 
 ```text
@@ -86,14 +62,13 @@ Start Command: node dist/remote.js
 
 ```env
 NODE_VERSION=20
-PUBLIC_BASE_URL=https://pco-mcp.cokistudio.com
-SUPABASE_URL=your_supabase_project_url
-SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key
+PUBLIC_BASE_URL=https://YOUR-HOST
+DATABASE_URL=your_neon_connection_string
 TOKEN_ENCRYPTION_KEY=generate_a_long_random_secret
 OAUTH_STATE_SECRET=generate_a_long_random_secret
 PCO_CLIENT_ID=your_planning_center_oauth_client_id
 PCO_CLIENT_SECRET=your_planning_center_oauth_client_secret
-PCO_REDIRECT_URI=https://pco-mcp.cokistudio.com/oauth/planning-center/callback
+PCO_REDIRECT_URI=https://YOUR-HOST/oauth/planning-center/callback
 PCO_SCOPES=people services groups check_ins registrations giving calendar
 ```
 
@@ -106,74 +81,32 @@ openssl rand -base64 48
 Use a different value for `TOKEN_ENCRYPTION_KEY` and `OAUTH_STATE_SECRET`.
 
 6. Deploy.
-7. Render will give you a URL like:
-
-```text
-https://pco-mcp.onrender.com
-```
-
-Open:
-
-```text
-https://pco-mcp.onrender.com/health
-```
-
-Expected response:
+7. Render will give you a URL like `https://pco-mcp.onrender.com`. Hit `/health`:
 
 ```json
 {"ok":true,"name":"planning-center-mcp-remote"}
 ```
 
-## 4. GoDaddy DNS Setup
+## 4. Custom Domain (optional)
 
-In GoDaddy:
+If you want a vanity host (e.g. `pco.example.com`) instead of `*.onrender.com`:
 
-1. Open **My Products → Domains → cokistudio.com → DNS**.
-2. Add a DNS record:
-
-```text
-Type: CNAME
-Name: pco-mcp
-Value: your-render-hostname.onrender.com
-TTL: 1 hour or default
-```
-
-Important: use the Render hostname only, without `https://`.
-
-Example:
-
-```text
-pco-mcp  CNAME  pco-mcp.onrender.com
-```
-
-3. In Render, go to your service → **Settings → Custom Domains**.
-4. Add:
-
-```text
-pco-mcp.cokistudio.com
-```
-
-5. Wait for DNS/SSL verification.
-6. Test:
-
-```text
-https://pco-mcp.cokistudio.com/health
-```
+1. In your DNS provider, add a CNAME for the chosen subdomain pointing at your Render hostname (no `https://`).
+2. In Render → Service → **Settings → Custom Domains**, add the subdomain.
+3. Wait for DNS/SSL verification, then update `PUBLIC_BASE_URL` and `PCO_REDIRECT_URI` env vars (and the PCO OAuth app's callback URL) accordingly.
 
 ## 5. First Hosted Connection Test
 
 Open:
 
 ```text
-https://pco-mcp.cokistudio.com/connect/planning-center
+https://YOUR-HOST/connect/planning-center
 ```
 
-You should be redirected to Planning Center.
-
-After approving, you should see a page with a Remote MCP server URL like:
+You'll be redirected to Planning Center. After approving, you'll see a page with a Remote MCP server URL like:
 
 ```text
-https://pco-mcp.cokistudio.com/mcp/pco_xxxxx
+https://YOUR-HOST/mcp/pco_xxxxx
 ```
 
 Copy that URL.
@@ -182,47 +115,23 @@ Copy that URL.
 
 In Claude:
 
-1. Open **Settings**.
-2. Go to **Connectors**.
-3. Choose **Add custom connector**.
-4. Name:
-
-```text
-Planning Center
-```
-
-5. Remote MCP server URL:
-
-```text
-https://pco-mcp.cokistudio.com/mcp/pco_xxxxx
-```
-
-6. Save.
+1. Open **Settings → Connectors → Add custom connector**.
+2. Name: `Planning Center`.
+3. Remote MCP server URL: paste the `/mcp/pco_xxxxx` URL.
+4. Save.
 
 ## 7. Test in Claude
 
-Ask:
+Try prompts like:
 
-```text
-Check my Planning Center connection status.
-```
-
-Then:
-
-```text
-List our Planning Center service types.
-```
-
-Then:
-
-```text
-What might break this Sunday?
-```
+- Check my Planning Center connection status.
+- List our Planning Center service types.
+- What might break this Sunday?
 
 ## Alpha Security Notes
 
 - The MCP URL contains a secret connector token. Treat it like a password.
 - Revoke a connector by setting `revoked_at = now()` for its row in `connector_tokens`.
-- Tokens are encrypted before being stored in Supabase.
-- Raw connector tokens are not stored; only SHA-256 hashes are stored.
+- Access and refresh tokens are AES-256-GCM encrypted at rest (`TOKEN_ENCRYPTION_KEY`).
+- Raw connector tokens are not stored; only SHA-256 hashes are.
 - This is a private alpha flow, not a full multi-tenant SaaS account system yet.
