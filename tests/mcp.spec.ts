@@ -900,3 +900,151 @@ test('summarizes preview, audits writes, and rolls back operation', async () => 
     await mock.close();
   }
 });
+
+test('summarizes giving against mocked Giving donations', async () => {
+  const mock = await startMockPco((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    const url = req.url ?? '';
+
+    if (url.startsWith('/giving/v2/donations')) {
+      res.end(JSON.stringify({
+        data: [
+          {
+            id: 'donation-1',
+            type: 'Donation',
+            attributes: { amount_cents: 5000, payment_method: 'card', received_at: '2026-05-04T12:00:00Z' },
+          },
+          {
+            id: 'donation-2',
+            type: 'Donation',
+            attributes: { amount_cents: 10000, payment_method: 'ach', received_at: '2026-05-05T12:00:00Z' },
+          },
+          {
+            id: 'donation-3',
+            type: 'Donation',
+            attributes: { amount_cents: 2500, payment_method: 'card', received_at: '2026-05-06T12:00:00Z' },
+          },
+        ],
+        meta: { total_count: 3 },
+      }));
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end(JSON.stringify({ errors: [{ detail: 'not found' }] }));
+  });
+
+  const mcp = new McpProcess({
+    PCO_APP_ID: 'test-id',
+    PCO_SECRET: 'test-secret',
+    PCO_BASE_URL: mock.url,
+  });
+
+  try {
+    await mcp.initialize();
+    const response = await mcp.request('tools/call', {
+      name: 'pco_get_giving_summary',
+      arguments: { startDate: '2026-05-01', endDate: '2026-05-31' },
+    }, 60);
+
+    expect(response.error).toBeFalsy();
+    const content = (response.result as { content: Array<{ text: string }> }).content;
+    const payload = JSON.parse(content[0].text) as {
+      success: boolean;
+      data: {
+        totalDonations: number;
+        totalAmount: number;
+        averageDonation: number;
+        byPaymentMethod: Record<string, { count: number; total: number }>;
+      };
+    };
+
+    expect(payload.success).toBe(true);
+    expect(payload.data.totalDonations).toBe(3);
+    expect(payload.data.totalAmount).toBe(175);
+    expect(payload.data.averageDonation).toBe(58.33);
+    expect(payload.data.byPaymentMethod.card).toEqual({ count: 2, total: 75 });
+    expect(payload.data.byPaymentMethod.ach).toEqual({ count: 1, total: 100 });
+  } finally {
+    await mcp.close();
+    await mock.close();
+  }
+});
+
+test('lists groups and flags groups without a leader against mocked Groups data', async () => {
+  const mock = await startMockPco((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    const url = req.url ?? '';
+
+    if (url.startsWith('/groups/v2/groups/group-1/memberships')) {
+      res.end(JSON.stringify({ data: [{ id: 'm-1', type: 'GroupMembership', attributes: { role: 'leader' } }], meta: { total_count: 1 } }));
+      return;
+    }
+
+    if (url.startsWith('/groups/v2/groups/group-2/memberships')) {
+      res.end(JSON.stringify({ data: [], meta: { total_count: 0 } }));
+      return;
+    }
+
+    if (url.startsWith('/groups/v2/groups')) {
+      res.end(JSON.stringify({
+        data: [
+          {
+            id: 'group-1',
+            type: 'Group',
+            attributes: { name: 'Sunday AM Bible Study', memberships_count: 8, enrollment_strategy: 'open' },
+          },
+          {
+            id: 'group-2',
+            type: 'Group',
+            attributes: { name: 'Wednesday Youth', memberships_count: 22, enrollment_strategy: 'request' },
+          },
+        ],
+        meta: { total_count: 2 },
+      }));
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end(JSON.stringify({ errors: [{ detail: 'not found' }] }));
+  });
+
+  const mcp = new McpProcess({
+    PCO_APP_ID: 'test-id',
+    PCO_SECRET: 'test-secret',
+    PCO_BASE_URL: mock.url,
+  });
+
+  try {
+    await mcp.initialize();
+
+    const listResponse = await mcp.request('tools/call', {
+      name: 'pco_list_groups',
+      arguments: { limit: 10 },
+    }, 62);
+    expect(listResponse.error).toBeFalsy();
+    const listPayload = JSON.parse((listResponse.result as any).content[0].text) as {
+      success: boolean;
+      data: Array<{ id: string; name: string }>;
+    };
+    expect(listPayload.success).toBe(true);
+    expect(listPayload.data.map((g) => g.id).sort()).toEqual(['group-1', 'group-2']);
+
+    const leaderlessResponse = await mcp.request('tools/call', {
+      name: 'pco_get_groups_without_leader',
+      arguments: {},
+    }, 63);
+    expect(leaderlessResponse.error).toBeFalsy();
+    const leaderlessPayload = JSON.parse((leaderlessResponse.result as any).content[0].text) as {
+      success: boolean;
+      data: Array<{ id: string; name: string }>;
+    };
+    expect(leaderlessPayload.success).toBe(true);
+    expect(leaderlessPayload.data).toHaveLength(1);
+    expect(leaderlessPayload.data[0].id).toBe('group-2');
+    expect(leaderlessPayload.data[0].name).toBe('Wednesday Youth');
+  } finally {
+    await mcp.close();
+    await mock.close();
+  }
+});

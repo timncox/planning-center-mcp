@@ -25,7 +25,7 @@
 - [x] Add Playwright coverage target: 90% where MCP/browser-visible behavior exists
 - [x] Implement first 3 core-loop Playwright tests
 - [x] Run validation commands
-- [ ] Expand mocked PCO fixture coverage across Services, Check-Ins, Giving, Groups
+- [x] Expand mocked PCO fixture coverage across Services, Check-Ins, Giving, Groups
 - [x] Add easy user install guide
 - [x] Prepare npm package bin metadata for `npx` / `pnpm dlx`
 - [x] Document release notes
