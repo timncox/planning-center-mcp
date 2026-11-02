@@ -6,3 +6,16 @@ dist/
 # Test artifacts
 test-results/
 playwright-report/
+# --- secrets & local files (added 2026-11-02, GitHub migration) ---
+.claude/worktrees/
+.dev.vars
+.env.*
+.env*.local
+.vercel
+*.key
+*.p12
+*.p8
+*.pem
+!.env.example
+!.env.*.example
+!.env.sample
